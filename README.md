@@ -21,6 +21,7 @@ Ralph is an implementation of the Geoffrey Huntley's technique for Claude Code t
 **Test Coverage**: 308 tests, 100% pass rate
 
 ### What's Working Now
+
 - Autonomous development loops with intelligent exit detection
 - **Dual-condition exit gate**: Requires BOTH completion indicators AND explicit EXIT_SIGNAL
 - Rate limiting with hourly reset (100 calls/hour, configurable)
@@ -41,6 +42,7 @@ Ralph is an implementation of the Geoffrey Huntley's technique for Claude Code t
 ### Recent Improvements
 
 **v0.9.9 - EXIT_SIGNAL Gate & Uninstall Script**
+
 - Fixed premature exit bug: completion indicators now require Claude's explicit `EXIT_SIGNAL: true`
 - Added dual-condition check preventing exits when Claude reports work in progress
 - Added `response_analyzer.sh` fix to respect explicit EXIT_SIGNAL over heuristics
@@ -50,6 +52,7 @@ Ralph is an implementation of the Geoffrey Huntley's technique for Claude Code t
 - Test count: 308 (up from 276)
 
 **v0.9.8 - Modern CLI for PRD Import**
+
 - Modernized `ralph_import.sh` to use Claude Code CLI JSON output format
 - JSON output format support with `--output-format json` for structured responses
 - Enhanced error handling with structured JSON error messages
@@ -58,6 +61,7 @@ Ralph is an implementation of the Geoffrey Huntley's technique for Claude Code t
 - Added 11 new tests for modern CLI features
 
 **v0.9.7 - Session Lifecycle Management**
+
 - Complete session lifecycle management with automatic reset triggers
 - Session auto-reset on: circuit breaker open, manual interrupt, project completion
 - Added `--reset-session` CLI flag for manual session reset
@@ -65,40 +69,48 @@ Ralph is an implementation of the Geoffrey Huntley's technique for Claude Code t
 - Added 26 new tests for session continuity features
 
 **v0.9.6 - JSON Output & Session Management**
+
 - Extended `parse_json_response()` to support Claude Code CLI JSON format
 - Added session management functions: `store_session_id()`, `get_last_session_id()`, `should_resume_session()`
 - Cross-platform epoch time utilities in date_utils.sh
 - Added 16 new tests covering Claude CLI format and session management
 
 **v0.9.5 - PRD Import Tests**
+
 - Added 22 comprehensive tests for `ralph_import.sh` PRD conversion script
 - Tests cover: file format support, output file creation, project naming, error handling
 
 **v0.9.4 - Project Setup Tests**
+
 - Added 36 comprehensive tests for `setup.sh` project initialization script
 - Tests cover: directory creation, template copying, git initialization
 
 **v0.9.3 - Installation Tests**
+
 - Added 14 comprehensive tests for `install.sh` global installation script
 - Tests cover: directory creation, command installation, dependency detection
 
 **v0.9.2 - Prompt File Fix**
+
 - Fixed critical bug: replaced non-existent `--prompt-file` CLI flag with `-p` flag
 - Modern CLI mode now correctly passes prompt content via `-p "$(cat file)"`
 - Added error handling for missing prompt files in `build_claude_command()`
 
 **v0.9.1 - Modern CLI Commands (Phase 1.1)**
+
 - JSON output format support with `--output-format json` (default)
 - Session continuity using `--continue` flag for cross-loop context
 - Tool permissions via `--allowed-tools` flag
 - CI/CD pipeline with kcov coverage reporting
 
 **v0.9.0 - Circuit Breaker Enhancements**
+
 - Fixed multi-line error matching in stuck loop detection
 - Eliminated JSON field false positives (e.g., `"is_error": false`)
 - Added two-stage error filtering for accurate detection
 
 ### In Progress
+
 - Expanding test coverage
 - Log rotation functionality
 - Dry-run mode
@@ -161,6 +173,7 @@ This adds `ralph`, `ralph-monitor`, and `ralph-setup` commands to your PATH.
 For each new project you want Ralph to work on:
 
 #### Option A: Import Existing PRD/Specifications
+
 ```bash
 # Convert existing PRD/specs to Ralph format (recommended)
 ralph-import my-requirements.md my-project
@@ -176,6 +189,7 @@ ralph --monitor
 ```
 
 #### Option B: Manual Project Setup
+
 ```bash
 # Create blank Ralph project
 ralph-setup my-awesome-project
@@ -230,10 +244,12 @@ Ralph operates on a simple but powerful cycle:
 Ralph uses a **dual-condition check** to prevent premature exits during productive iterations:
 
 **Exit requires BOTH conditions:**
+
 1. `completion_indicators >= 2` (heuristic detection from natural language patterns)
 2. Claude's explicit `EXIT_SIGNAL: true` in the RALPH_STATUS block
 
 **Example behavior:**
+
 ```
 Loop 5: Claude outputs "Phase complete, moving to next feature"
         → completion_indicators: 3 (high confidence from patterns)
@@ -247,6 +263,7 @@ Loop 8: Claude outputs "All tasks complete, project ready"
 ```
 
 **Other exit conditions:**
+
 - All tasks in `@fix_plan.md` marked complete
 - Multiple consecutive "done" signals from Claude Code
 - Too many test-focused loops (indicating feature completeness)
@@ -257,6 +274,7 @@ Loop 8: Claude outputs "All tasks complete, project ready"
 Ralph can convert existing PRDs, specifications, or requirement documents into the proper Ralph format using Claude Code.
 
 ### Supported Formats
+
 - **Markdown** (.md) - Product requirements, technical specs
 - **Text files** (.txt) - Plain text requirements
 - **JSON** (.json) - Structured requirement data
@@ -320,6 +338,7 @@ ralph --status
 ```
 
 The circuit breaker automatically:
+
 - Detects API errors and rate limit issues with advanced two-stage filtering
 - Opens circuit after 3 loops with no progress or 5 loops with same errors
 - Eliminates false positives from JSON fields containing "error"
@@ -330,6 +349,7 @@ The circuit breaker automatically:
 ### Claude API 5-Hour Limit
 
 When Claude's 5-hour usage limit is reached, Ralph:
+
 1. Detects the limit error automatically
 2. Prompts you to choose:
    - **Option 1**: Wait 60 minutes for the limit to reset (with countdown timer)
@@ -389,6 +409,7 @@ cat .ralph_session_history      # View session transition history
 ```
 
 **Session Auto-Reset Triggers:**
+
 - Circuit breaker opens (stagnation detected)
 - Manual interrupt (Ctrl+C / SIGINT)
 - Project completion (graceful exit)
@@ -402,6 +423,7 @@ Sessions are persisted to `.ralph_session` with a configurable expiration (defau
 Modify these variables in `~/.ralph/ralph_loop.sh`:
 
 **Exit Detection Thresholds:**
+
 ```bash
 MAX_CONSECUTIVE_TEST_LOOPS=3     # Exit after 3 test-only loops
 MAX_CONSECUTIVE_DONE_SIGNALS=2   # Exit after 2 "done" signals
@@ -409,6 +431,7 @@ TEST_PERCENTAGE_THRESHOLD=30     # Flag if 30%+ loops are test-only
 ```
 
 **Circuit Breaker Thresholds:**
+
 ```bash
 CB_NO_PROGRESS_THRESHOLD=3       # Open circuit after 3 loops with no file changes
 CB_SAME_ERROR_THRESHOLD=5        # Open circuit after 5 loops with repeated errors
@@ -506,6 +529,7 @@ bats tests/integration/test_installation.bats
 ```
 
 Current test status:
+
 - **308 tests** across 11 test files
 - **100% pass rate** (308/308 passing)
 - Comprehensive unit and integration tests
@@ -539,12 +563,14 @@ ralph-monitor
 ```
 
 Shows real-time:
+
 - Current loop count and status
 - API calls used vs. limit
 - Recent log entries
 - Rate limit countdown
 
 **tmux Controls:**
+
 - `Ctrl+B` then `D` - Detach from session (keeps Ralph running)
 - `Ctrl+B` then `←/→` - Switch between panes
 - `tmux list-sessions` - View active sessions
@@ -577,6 +603,7 @@ tail -f <state-dir>/logs/ralph.log
 Ralph is actively seeking contributors! We're working toward v1.0.0 with clear priorities and a detailed roadmap.
 
 **See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete contributor guide** including:
+
 - Getting started and setup instructions
 - Development workflow and commit conventions
 - Code style guidelines
@@ -625,6 +652,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Command Reference
 
 ### Installation Commands (Run Once)
+
 ```bash
 ./install.sh              # Install Ralph globally
 ./uninstall.sh            # Remove Ralph from system (dedicated script)
@@ -633,6 +661,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ```
 
 ### Ralph Loop Options
+
 ```bash
 ralph [OPTIONS]
   -h, --help              Show help message
@@ -652,6 +681,7 @@ ralph [OPTIONS]
 ```
 
 ### Project Commands (Per Project)
+
 ```bash
 ralph-setup project-name     # Create new Ralph project
 ralph-import prd.md project  # Convert PRD/specs to Ralph project
@@ -665,6 +695,7 @@ ralph-monitor                # Manual monitoring dashboard
 ```
 
 ### tmux Session Management
+
 ```bash
 tmux list-sessions        # View active Ralph sessions
 tmux attach -t <name>     # Reattach to detached session
@@ -680,6 +711,7 @@ Ralph is under active development with a clear path to v1.0.0. See [IMPLEMENTATI
 ### Current Status: v0.9.9
 
 **What's Delivered:**
+
 - Core loop functionality with intelligent exit detection
 - **Dual-condition exit gate** (completion indicators + EXIT_SIGNAL)
 - Rate limiting (100 calls/hour) and circuit breaker pattern
@@ -696,6 +728,7 @@ Ralph is under active development with a clear path to v1.0.0. See [IMPLEMENTATI
 - Dedicated uninstall script
 
 **Test Coverage Breakdown:**
+
 - Unit Tests: 164 (CLI parsing, JSON, exit detection, rate limiting, session continuity)
 - Integration Tests: 144 (loop execution, edge cases, installation, project setup, PRD import)
 - Test Files: 11
@@ -703,16 +736,19 @@ Ralph is under active development with a clear path to v1.0.0. See [IMPLEMENTATI
 ### Path to v1.0.0 (~4 weeks)
 
 **Enhanced Testing**
+
 - Installation and setup workflow tests
 - tmux integration tests
 - Monitor dashboard tests
 
 **Core Features**
+
 - Log rotation functionality
 - Dry-run mode
 - Configuration file support - .ralphrc
 
 **Advanced Features & Polish**
+
 - Metrics and analytics tracking
 - Desktop notifications
 - Git backup and rollback system
@@ -722,7 +758,9 @@ Ralph is under active development with a clear path to v1.0.0. See [IMPLEMENTATI
 See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for detailed progress tracking.
 
 ### How to Contribute
+
 Ralph is seeking contributors! See [CONTRIBUTING.md](CONTRIBUTING.md) for the complete guide. Priority areas:
+
 1. **Test Implementation** - Help expand test coverage ([see plan](IMPLEMENTATION_PLAN.md))
 2. **Feature Development** - Log rotation, dry-run mode, config files
 3. **Documentation** - Usage examples, tutorials, troubleshooting guides
@@ -736,14 +774,85 @@ Ralph is seeking contributors! See [CONTRIBUTING.md](CONTRIBUTING.md) for the co
 
 [![Star History Chart](https://api.star-history.com/svg?repos=frankbria/ralph-claude-code&type=date&legend=top-left)](https://www.star-history.com/#frankbria/ralph-claude-code&type=date&legend=top-left)
 
+## Monorepo Integration (bob_party)
+
+When used as a git submodule in [bob_party](https://github.com/bobProAI/bob_party), Ralph has additional features enabled by the `monorepo-state-dir` branch.
+
+### Using the run.sh Wrapper
+
+In bob_party, **always use `run.sh`** instead of invoking `ralph_loop.sh` directly:
+
+```bash
+# Correct - use the wrapper
+bash tools/ralph/run.sh --workspace apps/brain --monitor
+
+# Via pnpm script (defined in bob_party's package.json)
+pnpm ralph --workspace apps/brain --calls 10
+
+# Incorrect - missing state directory setup
+bash tools/ralph/ralph_loop.sh --monitor  # Don't do this in bob_party
+```
+
+The `run.sh` wrapper:
+
+1. Validates the workspace path exists and is relative
+2. Derives a workspace ID from the path (e.g., `apps/brain` -> `apps__brain`)
+3. Creates `.ralph/<workspace-id>/` state directory structure
+4. Generates template PROMPT.md and @fix_plan.md if missing
+5. Binds the workspace ID to the path (prevents accidental rebinding)
+6. Validates tool permissions support scoped tokens
+7. Invokes `ralph_loop.sh` with correct `--state-dir`, `--prompt`, and `--fix-plan` flags
+
+### Monorepo-Specific Patches
+
+This branch includes patches documented in [PATCHES.md](PATCHES.md):
+
+| Patch | Flag | Purpose |
+|-------|------|---------|
+| State directory | `--state-dir DIR` | Relocate all state under configurable directory |
+| Fix plan path | `--fix-plan FILE` | Configurable fix plan location |
+| Tool scoping | `--allowed-tools` | Support `Write(<glob>)`, `Edit(<glob>)` patterns |
+
+### AI Toolkit Integration
+
+Ralph integrates with [AI Toolkit](https://github.com/bobProAI/ai-toolkit) configurations installed in bob_party:
+
+- The generated `PROMPT.md` references `.claude/commands/` workflows
+- Ralph follows the Change Proposal (CP) workflow defined by AI Toolkit agents
+- Tool permissions align with AI Toolkit's permission tier system
+
+### bob_party-Specific Commands
+
+```bash
+# Via pnpm script
+pnpm ralph --workspace apps/brain --calls 10
+
+# Kill switch - prevents Ralph from running
+pnpm ralph --workspace apps/brain --disable
+
+# Force rebind workspace (if workspace moved)
+bash tools/ralph/run.sh --workspace apps/brain-v2 --workspace-id apps__brain --force
+
+# Re-enable by removing the DISABLED file
+rm .ralph/apps__brain/DISABLED
+```
+
+### Related Documentation
+
+- [AI Toolkit Repository](https://github.com/bobProAI/ai-toolkit) - Source of `.claude/` configurations
+- [bob_party Repository](https://github.com/bobProAI/bob_party) - Primary consumer of this submodule
+- [PATCHES.md](PATCHES.md) - Detailed patch documentation for monorepo features
+
 ## Pinned Version
 
 This is a pinned copy of Ralph for monorepo integration.
 
-- **Fork:** https://github.com/bobProAI/ralph-claude-code
+- **Fork:** <https://github.com/bobProAI/ralph-claude-code>
 - **Branch:** monorepo-state-dir
 - **SHA:** 80bb0ced1e4d9c6393bbd147a8d9e08ec2ee2bb0
 - **Update strategy:** Pinned (update intentionally only)
+- **Consumer repo:** [bob_party](https://github.com/bobProAI/bob_party) (uses Ralph at `tools/ralph`)
+- **Config source:** [ai-toolkit](https://github.com/bobProAI/ai-toolkit) (provides `.claude/` configurations)
 
 To update:
 
@@ -755,4 +864,3 @@ cd ../..
 git add tools/ralph
 git commit -m "chore(tools): update ralph to <new-sha>"
 ```
-
