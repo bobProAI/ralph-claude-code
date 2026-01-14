@@ -1,0 +1,16 @@
+{
+  "name": "ralph-tools",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "tools/ralph",
+  "projectType": "application",
+  "targets": {
+    "ralph": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "bash tools/ralph/run.sh {args}",
+        "cwd": "{workspaceRoot}",
+        "parallel": false
+      }
+    }
+  }
+}
