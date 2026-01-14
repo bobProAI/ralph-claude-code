@@ -117,7 +117,7 @@ Each scenario shows the exact conditions and expected behavior.
 **Given**:
 - All items in @fix_plan.md are marked [x]
 - Last test run shows all tests passing
-- No errors in recent logs/
+- No errors in recent logs (check `logs/` under the configured state dir)
 - All requirements from specs/ are implemented
 
 **When**: You evaluate project status at end of loop

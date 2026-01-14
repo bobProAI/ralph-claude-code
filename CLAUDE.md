@@ -127,8 +127,10 @@ The loop is controlled by several key files and environment variables:
 - **PROMPT.md** - Main prompt file that drives each loop iteration
 - **@fix_plan.md** - Prioritized task list that Ralph follows
 - **@AGENT.md** - Build and run instructions maintained by Ralph
-- **status.json** - Real-time status tracking (JSON format)
-- **logs/** - Execution logs for each loop iteration
+- **status.json** - Real-time status tracking (JSON format, at `$STATE_DIR/status.json`)
+- **logs/** - Execution logs for each loop iteration (at `$STATE_DIR/logs/`)
+
+Ralph supports monorepo-safe state isolation via `--state-dir DIR` (default: `.`). When set, all loop state (status/progress/logs/session files/exit signals/analysis artifacts) is written under that directory.
 
 ### Rate Limiting
 - Default: 100 API calls per hour (configurable via `--calls` flag)
@@ -142,14 +144,14 @@ Ralph uses modern Claude Code CLI flags for structured communication:
 **Configuration Variables:**
 ```bash
 CLAUDE_OUTPUT_FORMAT="json"           # Output format: json (default) or text
-CLAUDE_ALLOWED_TOOLS="Write,Bash(git *),Read"  # Allowed tool permissions
+CLAUDE_ALLOWED_TOOLS="Read,Write,Bash(git *),Bash(pnpm *)"  # Allowed tool permissions
 CLAUDE_USE_CONTINUE=true              # Enable session continuity
 CLAUDE_MIN_VERSION="2.0.76"           # Minimum Claude CLI version
 ```
 
 **CLI Options:**
 - `--output-format json|text` - Set Claude output format (default: json)
-- `--allowed-tools "Write,Read,Bash(git *)"` - Restrict allowed tools
+- `--allowed-tools "Read,Write,Bash(git *),Bash(pnpm *)"` - Restrict allowed tools
 - `--no-continue` - Disable session continuity, start fresh each loop
 
 **Loop Context:**
@@ -160,7 +162,7 @@ Each loop iteration injects context via `build_loop_context()`:
 - Previous loop work summary
 
 **Session Continuity:**
-- Sessions are preserved in `.claude_session_id`
+- Sessions are preserved in `.claude_session_id` (in the state dir)
 - Use `--continue` flag to maintain context across loops
 - Disable with `--no-continue` for isolated iterations
 
@@ -171,7 +173,7 @@ The loop uses a dual-condition check to prevent premature exits during productiv
 1. `recent_completion_indicators >= 2` (heuristic-based detection from natural language patterns)
 2. Claude's explicit `EXIT_SIGNAL: true` in the RALPH_STATUS block
 
-The `EXIT_SIGNAL` value is read from `.response_analysis` (at `.analysis.exit_signal`) which is populated by `response_analyzer.sh` from Claude's RALPH_STATUS output block.
+The `EXIT_SIGNAL` value is read from `$STATE_DIR/.response_analysis` (default: `.response_analysis`, at `.analysis.exit_signal`) which is populated by `response_analyzer.sh` from Claude's RALPH_STATUS output block.
 
 **Other exit conditions (checked before completion indicators):**
 - Multiple consecutive "done" signals from Claude Code (`done_signals >= 2`)
@@ -261,7 +263,7 @@ After installation, the following global commands are available:
 ## Integration Points
 
 Ralph integrates with:
-- **Claude Code CLI**: Uses `npx @anthropic/claude-code` as the execution engine
+- **Claude Code CLI**: Uses the `claude` CLI as the execution engine
 - **tmux**: Terminal multiplexer for integrated monitoring sessions
 - **Git**: Expects projects to be git repositories
 - **jq**: For JSON processing of status and exit signals
@@ -282,7 +284,7 @@ Ralph uses multiple mechanisms to detect when to exit:
 
 The `completion_indicators` exit condition requires dual verification:
 
-| completion_indicators | EXIT_SIGNAL | .response_analysis | Result |
+| completion_indicators | EXIT_SIGNAL | response analysis (`$STATE_DIR/.response_analysis`) | Result |
 |-----------------------|-------------|-------------------|--------|
 | >= 2 | `true` | exists | **Exit** ("project_complete") |
 | >= 2 | `false` | exists | **Continue** (Claude still working) |
@@ -292,9 +294,10 @@ The `completion_indicators` exit condition requires dual verification:
 
 **Implementation** (`ralph_loop.sh:312-327`):
 ```bash
+local analysis_file="${RESPONSE_ANALYSIS_FILE:-.response_analysis}"
 local claude_exit_signal="false"
-if [[ -f ".response_analysis" ]]; then
-    claude_exit_signal=$(jq -r '.analysis.exit_signal // false' ".response_analysis" 2>/dev/null || echo "false")
+if [[ -f "$analysis_file" ]]; then
+    claude_exit_signal=$(jq -r '.analysis.exit_signal // false' "$analysis_file" 2>/dev/null || echo "false")
 fi
 
 if [[ $recent_completion_indicators -ge 2 ]] && [[ "$claude_exit_signal" == "true" ]]; then

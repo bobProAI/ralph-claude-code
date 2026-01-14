@@ -441,6 +441,8 @@ my-project/
 └── docs/generated/     # Auto-generated documentation
 ```
 
+**Note:** All loop state is written under the configured state directory (`--state-dir DIR`, default: `.`). For example, logs live at `$STATE_DIR/logs/` and status at `$STATE_DIR/status.json`.
+
 ## Best Practices
 
 ### Writing Effective Prompts
@@ -460,8 +462,8 @@ my-project/
 ### Monitoring Progress
 
 - Use `ralph-monitor` for live status updates
-- Check logs in `logs/` for detailed execution history
-- Monitor `status.json` for programmatic access
+- Check logs in `$STATE_DIR/logs/` (default: `./logs/`) for detailed execution history
+- Monitor `$STATE_DIR/status.json` (default: `./status.json`) for programmatic access
 - Watch for exit condition signals
 
 ## System Requirements
@@ -555,7 +557,7 @@ Shows real-time:
 ralph --status
 
 # Manual log inspection
-tail -f logs/ralph.log
+tail -f <state-dir>/logs/ralph.log
 ```
 
 ### Common Issues
@@ -636,12 +638,13 @@ ralph [OPTIONS]
   -h, --help              Show help message
   -c, --calls NUM         Set max calls per hour (default: 100)
   -p, --prompt FILE       Set prompt file (default: PROMPT.md)
+  --state-dir DIR         Write all state under DIR (default: .)
   -s, --status            Show current status and exit
   -m, --monitor           Start with tmux session and live monitor
   -v, --verbose           Show detailed progress updates during execution
   -t, --timeout MIN       Set Claude Code execution timeout in minutes (1-120, default: 15)
   --output-format FORMAT  Set output format: json (default) or text
-  --allowed-tools TOOLS   Set allowed Claude tools (default: Write,Bash(git *),Read)
+  --allowed-tools TOOLS   Set allowed Claude tools (default: Read,Write,Bash(git *),Bash(pnpm *))
   --no-continue           Disable session continuity (start fresh each loop)
   --reset-circuit         Reset the circuit breaker
   --circuit-status        Show circuit breaker status
