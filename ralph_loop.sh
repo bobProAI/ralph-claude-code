@@ -12,37 +12,42 @@ source "$SCRIPT_DIR/lib/response_analyzer.sh"
 source "$SCRIPT_DIR/lib/circuit_breaker.sh"
 
 # Configuration
+STATE_DIR="."  # Default: current directory (preserves existing behavior)
 PROMPT_FILE="PROMPT.md"
-LOG_DIR="logs"
-DOCS_DIR="docs/generated"
-STATUS_FILE="status.json"
-PROGRESS_FILE="progress.json"
+FIX_PLAN_FILE="@fix_plan.md"  # Default fix plan location
+# Note: These paths are relative to STATE_DIR - they will be prefixed after arg parsing
+LOG_DIR_NAME="logs"
+DOCS_DIR_NAME="docs/generated"
+STATUS_FILE_NAME="status.json"
+PROGRESS_FILE_NAME="progress.json"
 CLAUDE_CODE_CMD="claude"
 MAX_CALLS_PER_HOUR=100  # Adjust based on your plan
 VERBOSE_PROGRESS=false  # Default: no verbose progress updates
 CLAUDE_TIMEOUT_MINUTES=15  # Default: 15 minutes timeout for Claude Code execution
 SLEEP_DURATION=3600     # 1 hour in seconds
-CALL_COUNT_FILE=".call_count"
-TIMESTAMP_FILE=".last_reset"
+# Note: These file names are prefixed with STATE_DIR after arg parsing
+CALL_COUNT_FILE_NAME=".call_count"
+TIMESTAMP_FILE_NAME=".last_reset"
 USE_TMUX=false
 
 # Modern Claude CLI configuration (Phase 1.1)
 CLAUDE_OUTPUT_FORMAT="json"              # Options: json, text
 CLAUDE_ALLOWED_TOOLS="Write,Bash(git *),Read"  # Comma-separated list of allowed tools
 CLAUDE_USE_CONTINUE=true                 # Enable session continuity
-CLAUDE_SESSION_FILE=".claude_session_id" # Session ID persistence file
+CLAUDE_SESSION_FILE_NAME=".claude_session_id" # Session ID persistence file (prefixed with STATE_DIR)
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
 
 # Session management configuration (Phase 1.2)
 # Note: SESSION_EXPIRATION_SECONDS is defined in lib/response_analyzer.sh (86400 = 24 hours)
-RALPH_SESSION_FILE=".ralph_session"              # Ralph-specific session tracking (lifecycle)
-RALPH_SESSION_HISTORY_FILE=".ralph_session_history"  # Session transition history
+RALPH_SESSION_FILE_NAME=".ralph_session"              # Ralph-specific session tracking (prefixed with STATE_DIR)
+RALPH_SESSION_HISTORY_FILE_NAME=".ralph_session_history"  # Session transition history (prefixed)
 # Session expiration: 24 hours default balances project continuity with fresh context
 # Too short = frequent context loss; Too long = stale context causes unpredictable behavior
 CLAUDE_SESSION_EXPIRY_HOURS=${CLAUDE_SESSION_EXPIRY_HOURS:-24}
 
 # Valid tool patterns for --allowed-tools validation
 # Tools can be exact matches or pattern matches with wildcards in parentheses
+# Scoped tools: Read(<glob>), Write(<glob>), Edit(<glob>) restrict file access
 VALID_TOOL_PATTERNS=(
     "Write"
     "Read"
@@ -57,14 +62,21 @@ VALID_TOOL_PATTERNS=(
     "Bash"
     "Bash(git *)"
     "Bash(npm *)"
+    "Bash(npx nx *)"
     "Bash(bats *)"
     "Bash(python *)"
     "Bash(node *)"
     "NotebookEdit"
 )
 
+# Allowed Bash command patterns for monorepo safety (used with scoped tokens)
+ALLOWED_BASH_PATTERNS=(
+    "git *"
+    "npx nx *"
+)
+
 # Exit detection configuration
-EXIT_SIGNALS_FILE=".exit_signals"
+EXIT_SIGNALS_FILE_NAME=".exit_signals"  # Prefixed with STATE_DIR after arg parsing
 MAX_CONSECUTIVE_TEST_LOOPS=3
 MAX_CONSECUTIVE_DONE_SIGNALS=2
 TEST_PERCENTAGE_THRESHOLD=30  # If more than 30% of recent loops are test-only, flag it
@@ -77,8 +89,32 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 NC='\033[0m' # No Color
 
-# Initialize directories
-mkdir -p "$LOG_DIR" "$DOCS_DIR"
+# Setup state paths with STATE_DIR prefix (called after arg parsing)
+setup_state_paths() {
+    # Validate STATE_DIR
+    if [ -z "$STATE_DIR" ]; then
+        echo "Error: --state-dir cannot be empty"
+        exit 1
+    fi
+
+    # Create STATE_DIR if missing
+    mkdir -p "$STATE_DIR"
+
+    # Apply STATE_DIR prefix to all state file paths
+    LOG_DIR="$STATE_DIR/$LOG_DIR_NAME"
+    DOCS_DIR="$STATE_DIR/$DOCS_DIR_NAME"
+    STATUS_FILE="$STATE_DIR/$STATUS_FILE_NAME"
+    PROGRESS_FILE="$STATE_DIR/$PROGRESS_FILE_NAME"
+    CALL_COUNT_FILE="$STATE_DIR/$CALL_COUNT_FILE_NAME"
+    TIMESTAMP_FILE="$STATE_DIR/$TIMESTAMP_FILE_NAME"
+    CLAUDE_SESSION_FILE="$STATE_DIR/$CLAUDE_SESSION_FILE_NAME"
+    RALPH_SESSION_FILE="$STATE_DIR/$RALPH_SESSION_FILE_NAME"
+    RALPH_SESSION_HISTORY_FILE="$STATE_DIR/$RALPH_SESSION_HISTORY_FILE_NAME"
+    EXIT_SIGNALS_FILE="$STATE_DIR/$EXIT_SIGNALS_FILE_NAME"
+
+    # Initialize directories under STATE_DIR
+    mkdir -p "$LOG_DIR" "$DOCS_DIR"
+}
 
 # Check if tmux is available
 check_tmux_available() {
@@ -327,15 +363,15 @@ should_exit_gracefully() {
     fi
     
     # 4. Check fix_plan.md for completion
-    if [[ -f "@fix_plan.md" ]]; then
-        local total_items=$(grep -c "^- \[" "@fix_plan.md" 2>/dev/null)
-        local completed_items=$(grep -c "^- \[x\]" "@fix_plan.md" 2>/dev/null)
+    if [[ -f "$FIX_PLAN_FILE" ]]; then
+        local total_items=$(grep -c "^- \[" "$FIX_PLAN_FILE" 2>/dev/null)
+        local completed_items=$(grep -c "^- \[x\]" "$FIX_PLAN_FILE" 2>/dev/null)
         
         # Handle case where grep returns no matches (exit code 1)
         [[ -z "$total_items" ]] && total_items=0
         [[ -z "$completed_items" ]] && completed_items=0
         
-        log_status "INFO" "DEBUG: @fix_plan.md check - total_items:$total_items, completed_items:$completed_items" >&2
+        log_status "INFO" "DEBUG: $FIX_PLAN_FILE check - total_items:$total_items, completed_items:$completed_items" >&2
         
         if [[ $total_items -gt 0 ]] && [[ $completed_items -eq $total_items ]]; then
             log_status "WARN" "Exit condition: All fix_plan.md items completed ($completed_items/$total_items)" >&2
@@ -343,7 +379,7 @@ should_exit_gracefully() {
             return 0
         fi
     else
-        log_status "INFO" "DEBUG: @fix_plan.md file not found" >&2
+        log_status "INFO" "DEBUG: $FIX_PLAN_FILE file not found" >&2
     fi
     
     log_status "INFO" "DEBUG: No exit conditions met, continuing loop" >&2
@@ -385,6 +421,8 @@ check_claude_version() {
 
 # Validate allowed tools against whitelist
 # Returns 0 if valid, 1 if invalid with error message
+# Supports scoped tokens: Read(<glob>), Write(<glob>), Edit(<glob>)
+# Bash(...) patterns are restricted to ALLOWED_BASH_PATTERNS for monorepo safety
 validate_allowed_tools() {
     local tools_input=$1
 
@@ -406,24 +444,51 @@ validate_allowed_tools() {
 
         local valid=false
 
-        # Check against valid patterns
+        # Check against exact valid patterns
         for pattern in "${VALID_TOOL_PATTERNS[@]}"; do
             if [[ "$tool" == "$pattern" ]]; then
                 valid=true
                 break
             fi
-
-            # Check for Bash(*) pattern - any Bash with parentheses is allowed
-            if [[ "$tool" =~ ^Bash\(.+\)$ ]]; then
-                valid=true
-                break
-            fi
         done
+
+        # If not exact match, check for scoped tokens
+        if [[ "$valid" == "false" ]]; then
+            # Check for scoped file tools: Read(<glob>), Write(<glob>), Edit(<glob>)
+            if [[ "$tool" =~ ^(Read|Write|Edit)\((.+)\)$ ]]; then
+                local glob_pattern="${BASH_REMATCH[2]}"
+                # Validate non-empty glob pattern
+                if [[ -n "$glob_pattern" && ! "$glob_pattern" =~ ^[[:space:]]*$ ]]; then
+                    valid=true
+                else
+                    echo "Error: Scoped tool '$tool' has empty or whitespace-only glob pattern"
+                    return 1
+                fi
+            fi
+
+            # Check for Bash(...) pattern - restricted to allowed patterns
+            if [[ "$tool" =~ ^Bash\((.+)\)$ ]]; then
+                local bash_pattern="${BASH_REMATCH[1]}"
+                # Check against allowed bash patterns
+                for allowed in "${ALLOWED_BASH_PATTERNS[@]}"; do
+                    if [[ "$bash_pattern" == "$allowed" ]]; then
+                        valid=true
+                        break
+                    fi
+                done
+                if [[ "$valid" == "false" ]]; then
+                    echo "Error: Bash pattern '$bash_pattern' is not in the allowed list"
+                    echo "Allowed Bash patterns: ${ALLOWED_BASH_PATTERNS[*]}"
+                    return 1
+                fi
+            fi
+        fi
 
         if [[ "$valid" == "false" ]]; then
             echo "Error: Invalid tool in --allowed-tools: '$tool'"
             echo "Valid tools: ${VALID_TOOL_PATTERNS[*]}"
-            echo "Note: Bash(...) patterns with any content are allowed (e.g., 'Bash(git *)')"
+            echo "Scoped tools: Read(<glob>), Write(<glob>), Edit(<glob>)"
+            echo "Allowed Bash patterns: ${ALLOWED_BASH_PATTERNS[*]}"
             return 1
         fi
     done
@@ -440,9 +505,9 @@ build_loop_context() {
     # Add loop number
     context="Loop #${loop_count}. "
 
-    # Extract incomplete tasks from @fix_plan.md
-    if [[ -f "@fix_plan.md" ]]; then
-        local incomplete_tasks=$(grep -c "^- \[ \]" "@fix_plan.md" 2>/dev/null || echo "0")
+    # Extract incomplete tasks from fix plan
+    if [[ -f "$FIX_PLAN_FILE" ]]; then
+        local incomplete_tasks=$(grep -c "^- \[ \]" "$FIX_PLAN_FILE" 2>/dev/null || echo "0")
         context+="Remaining tasks: ${incomplete_tasks}. "
     fi
 
@@ -1038,7 +1103,7 @@ main() {
         echo ""
         
         # Check if this looks like a partial Ralph project
-        if [[ -f "@fix_plan.md" ]] || [[ -d "specs" ]] || [[ -f "@AGENT.md" ]]; then
+        if [[ -f "$FIX_PLAN_FILE" ]] || [[ -d "specs" ]] || [[ -f "@AGENT.md" ]]; then
             echo "This appears to be a Ralph project but is missing PROMPT.md."
             echo "You may need to create or restore the PROMPT.md file."
         else
@@ -1195,8 +1260,13 @@ Options:
 Modern CLI Options (Phase 1.1):
     --output-format FORMAT  Set Claude output format: json or text (default: $CLAUDE_OUTPUT_FORMAT)
     --allowed-tools TOOLS   Comma-separated list of allowed tools (default: $CLAUDE_ALLOWED_TOOLS)
+                            Supports scoped tokens: Read(<glob>), Write(<glob>), Edit(<glob>)
     --no-continue           Disable session continuity across loops
     --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
+
+Monorepo Options (Phase 6.5):
+    --state-dir DIR         Directory for all state files (default: . - current directory)
+    --fix-plan FILE         Path to fix plan file (default: $FIX_PLAN_FILE)
 
 Files created:
     - $LOG_DIR/: All execution logs
@@ -1317,6 +1387,22 @@ while [[ $# -gt 0 ]]; do
             CLAUDE_SESSION_EXPIRY_HOURS="$2"
             shift 2
             ;;
+        --state-dir)
+            if [[ -z "$2" ]]; then
+                echo "Error: --state-dir requires a path argument"
+                exit 1
+            fi
+            STATE_DIR="$2"
+            shift 2
+            ;;
+        --fix-plan)
+            if [[ -z "$2" ]]; then
+                echo "Error: --fix-plan requires a file path argument"
+                exit 1
+            fi
+            FIX_PLAN_FILE="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             show_help
@@ -1324,6 +1410,9 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Setup state paths with STATE_DIR prefix
+setup_state_paths
 
 # Only execute when run directly, not when sourced
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
