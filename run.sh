@@ -202,20 +202,16 @@ You are running in an autonomous loop managed by Ralph.
 
 ## Workflow
 
-Follow the AI Toolkit workflow without relying on slash-command parsing:
+Follow the Bob Party AI Toolkit command workflows by reading their files (do not rely on slash-command parsing):
 
 **Why**: Ralph invokes Claude via the CLI with a prompt file; it does not automatically execute Claude Code's interactive slash-command handler.
 
-1. Read and follow `.claude/commands/explore.md` to understand context
-2. Read and follow `.claude/commands/plan.md` to create implementation plan
-3. Read and follow `.claude/commands/review-plan.md` to validate the plan
-4. Read and follow `.claude/commands/execute-plan.md` to implement
-
-For Bob Party changes, also follow these governance procedures:
-- `.claude/commands/create-cp.md` - Create Change Proposals
-- `.claude/commands/review-cp.md` - Review CPs
-- `.claude/commands/implement-cp.md` - Implement CP tasks
-- `.claude/commands/validate-tenets.md` - Validate tenet compliance
+1. Use `.claude/commands/create-cp.md` to create a Change Proposal for substantive work.
+2. Use `.claude/commands/review-cp.md` to validate the CP.
+3. Use `.claude/commands/implement-cp.md` to implement tasks.
+4. Use `.claude/commands/validate-tenets.md` to check tenet compliance.
+5. Use `.claude/commands/design-event.md` and `.claude/commands/design-agent.md` when designing events or agents.
+6. Use `.claude/commands/sync-vendored.md` when updating vendored assets.
 
 ## Rules
 
@@ -264,7 +260,7 @@ fi
 
 # --- Set Default Tools (Minimal Safe Set) ---
 if [ -z "$TOOLS" ]; then
-  TOOLS="Read,Glob,Grep,TodoWrite,Task,Write(.ralph/**),Edit(.ralph/**),Bash(npx nx *)"
+  TOOLS="Read,Glob,Grep,TodoWrite,Task,Write(.ralph/**),Edit(.ralph/**),Bash(pnpm *)"
 fi
 
 # --- Compatibility Check for --tools ---

@@ -51,13 +51,13 @@ detect_output_format() {
 }
 
 # Parse JSON response and extract structured fields
-# Creates .json_parse_result with normalized analysis data
+# Creates JSON parse result file with normalized analysis data (default: .json_parse_result)
 # Supports TWO JSON formats:
 # 1. Flat format: { status, exit_signal, work_type, files_modified, ... }
 # 2. Claude CLI format: { result, sessionId, metadata: { files_changed, has_errors, completion_status, ... } }
 parse_json_response() {
     local output_file=$1
-    local result_file="${2:-.json_parse_result}"
+    local result_file="${2:-${JSON_PARSE_RESULT_FILE:-.json_parse_result}}"
 
     if [[ ! -f "$output_file" ]]; then
         echo "ERROR: Output file not found: $output_file" >&2
@@ -198,7 +198,8 @@ parse_json_response() {
 analyze_response() {
     local output_file=$1
     local loop_number=$2
-    local analysis_result_file=${3:-".response_analysis"}
+    local analysis_result_file=${3:-"${RESPONSE_ANALYSIS_FILE:-.response_analysis}"}
+    local json_parse_result_file="${JSON_PARSE_RESULT_FILE:-.json_parse_result}"
 
     # Initialize analysis result
     local has_completion_signal=false
@@ -224,16 +225,16 @@ analyze_response() {
 
     if [[ "$output_format" == "json" ]]; then
         # Try JSON parsing
-        if parse_json_response "$output_file" ".json_parse_result" 2>/dev/null; then
+        if parse_json_response "$output_file" "$json_parse_result_file" 2>/dev/null; then
             # Extract values from JSON parse result
-            has_completion_signal=$(jq -r '.has_completion_signal' .json_parse_result 2>/dev/null || echo "false")
-            exit_signal=$(jq -r '.exit_signal' .json_parse_result 2>/dev/null || echo "false")
-            is_test_only=$(jq -r '.is_test_only' .json_parse_result 2>/dev/null || echo "false")
-            is_stuck=$(jq -r '.is_stuck' .json_parse_result 2>/dev/null || echo "false")
-            work_summary=$(jq -r '.summary' .json_parse_result 2>/dev/null || echo "")
-            files_modified=$(jq -r '.files_modified' .json_parse_result 2>/dev/null || echo "0")
-            local json_confidence=$(jq -r '.confidence' .json_parse_result 2>/dev/null || echo "0")
-            local session_id=$(jq -r '.session_id' .json_parse_result 2>/dev/null || echo "")
+            has_completion_signal=$(jq -r '.has_completion_signal' "$json_parse_result_file" 2>/dev/null || echo "false")
+            exit_signal=$(jq -r '.exit_signal' "$json_parse_result_file" 2>/dev/null || echo "false")
+            is_test_only=$(jq -r '.is_test_only' "$json_parse_result_file" 2>/dev/null || echo "false")
+            is_stuck=$(jq -r '.is_stuck' "$json_parse_result_file" 2>/dev/null || echo "false")
+            work_summary=$(jq -r '.summary' "$json_parse_result_file" 2>/dev/null || echo "")
+            files_modified=$(jq -r '.files_modified' "$json_parse_result_file" 2>/dev/null || echo "0")
+            local json_confidence=$(jq -r '.confidence' "$json_parse_result_file" 2>/dev/null || echo "0")
+            local session_id=$(jq -r '.session_id' "$json_parse_result_file" 2>/dev/null || echo "")
 
             # Persist session ID if present (for session continuity across loop iterations)
             if [[ -n "$session_id" && "$session_id" != "null" ]]; then
@@ -289,7 +290,7 @@ analyze_response() {
                         output_length: $output_length
                     }
                 }' > "$analysis_result_file"
-            rm -f ".json_parse_result"
+            rm -f "$json_parse_result_file"
             return 0
         fi
         # If JSON parsing failed, fall through to text parsing
@@ -463,8 +464,8 @@ analyze_response() {
 
 # Update exit signals file based on analysis
 update_exit_signals() {
-    local analysis_file=${1:-".response_analysis"}
-    local exit_signals_file=${2:-".exit_signals"}
+    local analysis_file=${1:-"${RESPONSE_ANALYSIS_FILE:-.response_analysis}"}
+    local exit_signals_file=${2:-"${EXIT_SIGNALS_FILE:-.exit_signals}"}
 
     if [[ ! -f "$analysis_file" ]]; then
         echo "ERROR: Analysis file not found: $analysis_file"
@@ -514,7 +515,7 @@ update_exit_signals() {
 
 # Log analysis results in human-readable format
 log_analysis_summary() {
-    local analysis_file=${1:-".response_analysis"}
+    local analysis_file=${1:-"${RESPONSE_ANALYSIS_FILE:-.response_analysis}"}
 
     if [[ ! -f "$analysis_file" ]]; then
         return 1

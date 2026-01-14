@@ -23,6 +23,5 @@ Default is `@fix_plan.md` to preserve backward compatibility.
 ### Tool Scoping
 Extended `--allowed-tools` validation to support:
 - Scoped file tools: `Read(<glob>)`, `Write(<glob>)`, `Edit(<glob>)`
-- Bash patterns restricted to allowlist: `git *`, `npx nx *`
+- Bash patterns restricted to allowlist: `git *`, `pnpm *`
 - Empty globs are rejected (e.g., `Write()` fails)
-

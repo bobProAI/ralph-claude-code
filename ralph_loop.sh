@@ -32,7 +32,7 @@ USE_TMUX=false
 
 # Modern Claude CLI configuration (Phase 1.1)
 CLAUDE_OUTPUT_FORMAT="json"              # Options: json, text
-CLAUDE_ALLOWED_TOOLS="Write,Bash(git *),Read"  # Comma-separated list of allowed tools
+CLAUDE_ALLOWED_TOOLS="Read,Write,Bash(git *),Bash(pnpm *)"  # Comma-separated list of allowed tools
 CLAUDE_USE_CONTINUE=true                 # Enable session continuity
 CLAUDE_SESSION_FILE_NAME=".claude_session_id" # Session ID persistence file (prefixed with STATE_DIR)
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
@@ -59,20 +59,15 @@ VALID_TOOL_PATTERNS=(
     "TodoWrite"
     "WebFetch"
     "WebSearch"
-    "Bash"
     "Bash(git *)"
-    "Bash(npm *)"
-    "Bash(npx nx *)"
-    "Bash(bats *)"
-    "Bash(python *)"
-    "Bash(node *)"
+    "Bash(pnpm *)"
     "NotebookEdit"
 )
 
 # Allowed Bash command patterns for monorepo safety (used with scoped tokens)
 ALLOWED_BASH_PATTERNS=(
     "git *"
-    "npx nx *"
+    "pnpm *"
 )
 
 # Exit detection configuration
@@ -111,6 +106,10 @@ setup_state_paths() {
     RALPH_SESSION_FILE="$STATE_DIR/$RALPH_SESSION_FILE_NAME"
     RALPH_SESSION_HISTORY_FILE="$STATE_DIR/$RALPH_SESSION_HISTORY_FILE_NAME"
     EXIT_SIGNALS_FILE="$STATE_DIR/$EXIT_SIGNALS_FILE_NAME"
+    CB_STATE_FILE="$STATE_DIR/.circuit_breaker_state"
+    CB_HISTORY_FILE="$STATE_DIR/.circuit_breaker_history"
+    RESPONSE_ANALYSIS_FILE="$STATE_DIR/.response_analysis"
+    JSON_PARSE_RESULT_FILE="$STATE_DIR/.json_parse_result"
 
     # Initialize directories under STATE_DIR
     mkdir -p "$LOG_DIR" "$DOCS_DIR"
@@ -143,9 +142,9 @@ setup_tmux_session() {
     
     # Start monitor in the right pane
     if command -v ralph-monitor &> /dev/null; then
-        tmux send-keys -t "$session_name:0.1" "ralph-monitor" Enter
+        tmux send-keys -t "$session_name:0.1" "ralph-monitor --state-dir '$STATE_DIR'" Enter
     else
-        tmux send-keys -t "$session_name:0.1" "'$ralph_home/ralph_monitor.sh'" Enter
+        tmux send-keys -t "$session_name:0.1" "'$ralph_home/ralph_monitor.sh' --state-dir '$STATE_DIR'" Enter
     fi
     
     # Start ralph loop in the left pane (exclude tmux flag to avoid recursion)
@@ -348,10 +347,10 @@ should_exit_gracefully() {
     # 3. Strong completion indicators (only if Claude's EXIT_SIGNAL is true)
     # This prevents premature exits when heuristics detect completion patterns
     # but Claude explicitly indicates work is still in progress via RALPH_STATUS block.
-    # The exit_signal in .response_analysis represents Claude's explicit intent.
+    # The exit_signal in $RESPONSE_ANALYSIS_FILE represents Claude's explicit intent.
     local claude_exit_signal="false"
-    if [[ -f ".response_analysis" ]]; then
-        claude_exit_signal=$(jq -r '.analysis.exit_signal // false' ".response_analysis" 2>/dev/null || echo "false")
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        claude_exit_signal=$(jq -r '.analysis.exit_signal // false' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "false")
     fi
 
     if [[ $recent_completion_indicators -ge 2 ]] && [[ "$claude_exit_signal" == "true" ]]; then
@@ -512,16 +511,16 @@ build_loop_context() {
     fi
 
     # Add circuit breaker state
-    if [[ -f ".circuit_breaker_state" ]]; then
-        local cb_state=$(jq -r '.state // "UNKNOWN"' .circuit_breaker_state 2>/dev/null)
+    if [[ -f "$CB_STATE_FILE" ]]; then
+        local cb_state=$(jq -r '.state // "UNKNOWN"' "$CB_STATE_FILE" 2>/dev/null)
         if [[ "$cb_state" != "CLOSED" && "$cb_state" != "null" && -n "$cb_state" ]]; then
             context+="Circuit breaker: ${cb_state}. "
         fi
     fi
 
     # Add previous loop summary (truncated)
-    if [[ -f ".response_analysis" ]]; then
-        local prev_summary=$(jq -r '.analysis.work_summary // ""' .response_analysis 2>/dev/null | head -c 200)
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        local prev_summary=$(jq -r '.analysis.work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null | head -c 200)
         if [[ -n "$prev_summary" && "$prev_summary" != "null" ]]; then
             context+="Previous: ${prev_summary}"
         fi
@@ -1016,14 +1015,14 @@ EOF
 
         # Analyze the response
         log_status "INFO" "🔍 Analyzing Claude Code response..."
-        analyze_response "$output_file" "$loop_count"
+        analyze_response "$output_file" "$loop_count" "$RESPONSE_ANALYSIS_FILE"
         local analysis_exit_code=$?
 
         # Update exit signals based on analysis
-        update_exit_signals
+        update_exit_signals "$RESPONSE_ANALYSIS_FILE" "$EXIT_SIGNALS_FILE"
 
         # Log analysis summary
-        log_analysis_summary
+        log_analysis_summary "$RESPONSE_ANALYSIS_FILE"
 
         # Get file change count for circuit breaker
         local files_changed=$(git diff --name-only 2>/dev/null | wc -l || echo 0)

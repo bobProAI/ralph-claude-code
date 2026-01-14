@@ -12,8 +12,8 @@ CB_STATE_HALF_OPEN="HALF_OPEN"  # Monitoring mode, checking for recovery
 CB_STATE_OPEN="OPEN"            # Failure detected, execution halted
 
 # Circuit Breaker Configuration
-CB_STATE_FILE=".circuit_breaker_state"
-CB_HISTORY_FILE=".circuit_breaker_history"
+CB_STATE_FILE="${CB_STATE_FILE:-.circuit_breaker_state}"
+CB_HISTORY_FILE="${CB_HISTORY_FILE:-.circuit_breaker_history}"
 CB_NO_PROGRESS_THRESHOLD=3      # Open circuit after N loops with no progress
 CB_SAME_ERROR_THRESHOLD=5       # Open circuit after N loops with same error
 CB_OUTPUT_DECLINE_THRESHOLD=70  # Open circuit if output declines by >70%
@@ -307,8 +307,8 @@ should_halt_execution() {
         echo "  • Manual intervention may be required"
         echo ""
         echo -e "${YELLOW}To continue:${NC}"
-        echo "  1. Review recent logs: tail -20 logs/ralph.log"
-        echo "  2. Check Claude output: ls -lt logs/claude_output_*.log | head -1"
+        echo "  1. Review recent logs: tail -20 ${LOG_DIR:-logs}/ralph.log"
+        echo "  2. Check Claude output: ls -lt ${LOG_DIR:-logs}/claude_output_*.log | head -1"
         echo "  3. Update @fix_plan.md if needed"
         echo "  4. Reset circuit breaker: ralph --reset-circuit"
         echo ""
