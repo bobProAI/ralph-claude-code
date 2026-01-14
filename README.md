@@ -732,3 +732,24 @@ Ralph is seeking contributors! See [CONTRIBUTING.md](CONTRIBUTING.md) for the co
 ## Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=frankbria/ralph-claude-code&type=date&legend=top-left)](https://www.star-history.com/#frankbria/ralph-claude-code&type=date&legend=top-left)
+
+## Pinned Version
+
+This is a pinned copy of Ralph for monorepo integration.
+
+- **Fork:** https://github.com/bobProAI/ralph-claude-code
+- **Branch:** monorepo-state-dir
+- **SHA:** 80bb0ced1e4d9c6393bbd147a8d9e08ec2ee2bb0
+- **Update strategy:** Pinned (update intentionally only)
+
+To update:
+
+```bash
+cd tools/ralph
+git fetch origin
+git checkout <new-sha>
+cd ../..
+git add tools/ralph
+git commit -m "chore(tools): update ralph to <new-sha>"
+```
+
