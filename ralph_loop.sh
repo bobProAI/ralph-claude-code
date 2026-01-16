@@ -655,7 +655,9 @@ calculate_wait_time() {
 
     # Extract reset time and timezone using extended regex
     # Supports: "resets 11pm", "resets 11:30pm", "resets 11:30 pm"
-    if [[ "$error_msg" =~ resets[[:space:]]([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*(am|pm)[[:space:]]*\(([^)]+)\) ]]; then
+    # Note: Store regex in variable to avoid bash parsing issues with special characters
+    local reset_regex='resets[[:space:]]([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*(am|pm)[[:space:]]*\(([^)]+)\)'
+    if [[ "$error_msg" =~ $reset_regex ]]; then
         local hour="${BASH_REMATCH[1]}"
         local minute="${BASH_REMATCH[3]:-00}"
         local ampm="${BASH_REMATCH[4]}"
