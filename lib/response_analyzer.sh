@@ -137,13 +137,17 @@ parse_json_response() {
     # CP-016.26: Track MCP tool usage when JSON output includes usage metadata
     # This helps verify Codex delegation is working
     local mcp_calls=0
-    if jq -e '.modelUsage // .usage // .tool_usage' "$output_file" >/dev/null 2>&1; then
-        # Count Codex MCP tool calls from usage metadata
-        mcp_calls=$(jq -r '(.modelUsage // .usage // .tool_usage // {}) | keys[]' "$output_file" 2>/dev/null | grep -c "codex" || echo "0")
-    fi
+    mcp_calls=$(jq -r '(.modelUsage // .usage // .tool_usage // {}) | keys | map(select(test("codex"))) | length' "$output_file" 2>/dev/null || echo "0")
     # Also check for mcp__ patterns in the result text (tool call evidence)
     if [[ "$summary" == *"mcp__codex__"* ]]; then
-        mcp_calls=$((mcp_calls + $(echo "$summary" | grep -oE 'mcp__codex__[a-z_]+' | wc -l)))
+        local summary_mcp_calls
+        summary_mcp_calls=$(echo "$summary" | grep -oE 'mcp__codex__[a-z_]+' | wc -l | tr -d ' ')
+        if [[ "$summary_mcp_calls" =~ ^[0-9]+$ ]]; then
+            mcp_calls=$((mcp_calls + summary_mcp_calls))
+        fi
+    fi
+    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
+        mcp_calls=0
     fi
 
     # Normalize values
@@ -241,6 +245,7 @@ analyze_response() {
     local exit_signal=false
     local work_summary=""
     local files_modified=0
+    local mcp_calls=0
 
     # Read output file
     if [[ ! -f "$output_file" ]]; then
@@ -266,6 +271,10 @@ analyze_response() {
             files_modified=$(jq -r '.files_modified' "$json_parse_result_file" 2>/dev/null || echo "0")
             local json_confidence=$(jq -r '.confidence' "$json_parse_result_file" 2>/dev/null || echo "0")
             local session_id=$(jq -r '.session_id' "$json_parse_result_file" 2>/dev/null || echo "")
+            local mcp_calls=$(jq -r '.mcp_calls // 0' "$json_parse_result_file" 2>/dev/null || echo "0")
+            if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
+                mcp_calls=0
+            fi
 
             # Persist session ID if present (for session continuity across loop iterations)
             if [[ -n "$session_id" && "$session_id" != "null" ]]; then
@@ -304,11 +313,13 @@ analyze_response() {
                 --argjson exit_signal "$exit_signal" \
                 --arg work_summary "$work_summary" \
                 --argjson output_length "$output_length" \
+                --argjson mcp_calls "$mcp_calls" \
                 '{
                     loop_number: $loop_number,
                     timestamp: $timestamp,
                     output_file: $output_file,
                     output_format: $output_format,
+                    mcp_calls: $mcp_calls,
                     analysis: {
                         has_completion_signal: $has_completion_signal,
                         is_test_only: $is_test_only,
@@ -318,7 +329,8 @@ analyze_response() {
                         confidence_score: $confidence_score,
                         exit_signal: $exit_signal,
                         work_summary: $work_summary,
-                        output_length: $output_length
+                        output_length: $output_length,
+                        mcp_calls: $mcp_calls
                     }
                 }' > "$analysis_result_file"
             rm -f "$json_parse_result_file"
@@ -446,6 +458,14 @@ analyze_response() {
         fi
     fi
 
+    # 8.5 Track MCP tool usage from text output if present
+    if [[ "$output_content" == *"mcp__codex__"* ]]; then
+        mcp_calls=$(echo "$output_content" | grep -oE 'mcp__codex__[a-z_]+' | wc -l | tr -d ' ')
+        if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
+            mcp_calls=0
+        fi
+    fi
+
     # 9. Determine exit signal based on confidence (heuristic)
     # IMPORTANT: Only apply heuristics if no explicit EXIT_SIGNAL was found in RALPH_STATUS
     # Claude's explicit intent takes precedence over natural language pattern matching
@@ -470,11 +490,13 @@ analyze_response() {
         --argjson exit_signal "$exit_signal" \
         --arg work_summary "$work_summary" \
         --argjson output_length "$output_length" \
+        --argjson mcp_calls "$mcp_calls" \
         '{
             loop_number: $loop_number,
             timestamp: $timestamp,
             output_file: $output_file,
             output_format: $output_format,
+            mcp_calls: $mcp_calls,
             analysis: {
                 has_completion_signal: $has_completion_signal,
                 is_test_only: $is_test_only,
@@ -484,7 +506,8 @@ analyze_response() {
                 confidence_score: $confidence_score,
                 exit_signal: $exit_signal,
                 work_summary: $work_summary,
-                output_length: $output_length
+                output_length: $output_length,
+                mcp_calls: $mcp_calls
             }
         }' > "$analysis_result_file"
 
