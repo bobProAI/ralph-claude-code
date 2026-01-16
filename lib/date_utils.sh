@@ -22,15 +22,20 @@ get_iso_timestamp() {
 # Get time component (HH:MM:SS) for one hour from now
 # Returns: HH:MM:SS format
 get_next_hour_time() {
-    local os_type
-    os_type=$(uname)
-
-    if [[ "$os_type" == "Darwin" ]]; then
-        # macOS (BSD date) - use -v flag for date arithmetic
-        date -v+1H '+%H:%M:%S'
+    # Try BSD date first (macOS native), then GNU date (Linux or Homebrew coreutils)
+    # This handles cases where PATH has GNU coreutils even on macOS
+    if date -v+1H '+%H:%M:%S' 2>/dev/null; then
+        return 0
+    elif date -d '+1 hour' '+%H:%M:%S' 2>/dev/null; then
+        return 0
     else
-        # Linux (GNU date) - use -d flag for date arithmetic
-        date -d '+1 hour' '+%H:%M:%S'
+        # Fallback: calculate manually using epoch arithmetic
+        local current_epoch next_epoch
+        current_epoch=$(date +%s)
+        next_epoch=$((current_epoch + 3600))
+        date -r "$next_epoch" '+%H:%M:%S' 2>/dev/null || \
+        date -d "@$next_epoch" '+%H:%M:%S' 2>/dev/null || \
+        echo "??:??:??"
     fi
 }
 
