@@ -60,6 +60,19 @@ EOF
     assert_equal "$output" "json"
 }
 
+@test "detect_output_format identifies stream-json output" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    # Claude --output-format=stream-json yields multiple JSON objects (JSONL)
+    cat > "$output_file" << 'EOF'
+{"type":"tool_use","name":"mcp__codex__codex","input":{"prompt":"hi"}}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-123"}
+EOF
+
+    run detect_output_format "$output_file"
+    assert_equal "$output" "stream-json"
+}
+
 @test "detect_output_format identifies text output" {
     local output_file="$LOG_DIR/test_output.log"
 
@@ -759,7 +772,7 @@ EOF
     run parse_json_response "$output_file"
     local result_file=".json_parse_result"
 
-    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+    [[ -f "$result_file" ]] || fail "parse_stream_json_response did not create result file"
 
     # Critical: exit_signal MUST be true when embedded RALPH_STATUS says EXIT_SIGNAL: true
     local exit_signal=$(jq -r '.exit_signal' "$result_file")
@@ -850,7 +863,7 @@ EOF
 # CP-016.26: MCP CALL TRACKING TESTS
 # =============================================================================
 
-@test "parse_json_response tracks mcp_calls from result text" {
+@test "parse_json_response does not infer mcp_calls from result text" {
     local output_file="$LOG_DIR/test_output.log"
 
     cat > "$output_file" << 'EOF'
@@ -866,19 +879,37 @@ EOF
     [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
 
     local mcp_calls=$(jq -r '.mcp_calls' "$result_file")
-    [[ "$mcp_calls" -ge 1 ]] || fail "Expected at least 1 MCP call, got $mcp_calls"
+    assert_equal "$mcp_calls" "0"
 }
 
-@test "parse_json_response tracks mcp_calls from usage metadata" {
+@test "parse_stream_json_response counts mcp_calls from tool_use events" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    cat > "$output_file" << 'EOF'
+{"type":"tool_use","name":"mcp__codex__codex","input":{"prompt":"review"}}
+{"type":"result","subtype":"success","is_error":false,"result":"done","session_id":"mcp-stream-test","permission_denials":[]}
+EOF
+
+    run parse_stream_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    local mcp_calls=$(jq -r '.mcp_calls' "$result_file")
+    assert_equal "$mcp_calls" "1"
+}
+
+@test "parse_json_response tracks mcp_denied from permission_denials" {
     local output_file="$LOG_DIR/test_output.log"
 
     cat > "$output_file" << 'EOF'
 {
-    "result": "Task completed.",
-    "sessionId": "mcp-usage-test",
-    "modelUsage": {
-        "codex_requests": 3
-    }
+    "result": "Codex patch request attempted.",
+    "sessionId": "mcp-denied-test",
+    "permission_denials": [
+        {"tool_name": "mcp__codex__codex"},
+        {"tool_name": "Bash"}
+    ]
 }
 EOF
 
@@ -887,7 +918,6 @@ EOF
 
     [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
 
-    # Should detect codex in usage keys
-    local mcp_calls=$(jq -r '.mcp_calls' "$result_file")
-    [[ "$mcp_calls" -ge 1 ]] || fail "Expected at least 1 MCP call from usage metadata, got $mcp_calls"
+    local mcp_denied=$(jq -r '.mcp_denied' "$result_file")
+    [[ "$mcp_denied" -ge 1 ]] || fail "Expected at least 1 MCP denial, got $mcp_denied"
 }

@@ -13,6 +13,14 @@ setup() {
     export CALL_COUNT_FILE=".call_count"
     export TIMESTAMP_FILE=".last_reset"
 
+    # Stub logger used by calculate_wait_time (avoid noisy output)
+    log_status() { :; }
+
+    # Source CP-016.26 autonomous helpers directly from ralph_loop.sh
+    local ralph_loop_sh="${BATS_TEST_DIRNAME}/../../ralph_loop.sh"
+    source <(sed -n '/^loop_count_pre_increment_for_resume() {/,/^}$/p' "$ralph_loop_sh")
+    source <(sed -n '/^calculate_wait_time() {/,/^}$/p' "$ralph_loop_sh")
+
     # Create temp test directory
     export TEST_TEMP_DIR="$(mktemp -d /tmp/ralph-test.XXXXXX)"
     cd "$TEST_TEMP_DIR"
@@ -202,4 +210,60 @@ increment_call_counter() {
 
     run can_make_call
     assert_success
+}
+
+# =============================================================================
+# CP-016.26: AUTONOMOUS RATE LIMIT WAIT + RESUME HELPERS
+# =============================================================================
+
+@test "calculate_wait_time falls back to 3600 when reset time cannot be parsed" {
+    run calculate_wait_time "You've hit your limit."
+    assert_success
+    assert_equal "$output" "3600"
+}
+
+@test "calculate_wait_time falls back to 3600 when timezone is invalid" {
+    run calculate_wait_time "You've hit your limit · resets 11pm (Invalid/Timezone)"
+    assert_success
+    assert_equal "$output" "3600"
+}
+
+@test "calculate_wait_time parses hour-only reset time" {
+    run calculate_wait_time "You've hit your limit · resets 11pm (UTC)"
+    assert_success
+    [[ "$output" =~ ^[0-9]+$ ]] || fail "Expected integer seconds, got: $output"
+    [[ "$output" -ge 300 ]] || fail "Expected >=300 seconds buffer, got: $output"
+    [[ "$output" -le 90000 ]] || fail "Expected <=90000 seconds, got: $output"
+}
+
+@test "calculate_wait_time parses hour+minute reset time" {
+    run calculate_wait_time "You've hit your limit · resets 11:30pm (UTC)"
+    assert_success
+    [[ "$output" =~ ^[0-9]+$ ]] || fail "Expected integer seconds, got: $output"
+    [[ "$output" -ge 300 ]] || fail "Expected >=300 seconds buffer, got: $output"
+    [[ "$output" -le 90000 ]] || fail "Expected <=90000 seconds, got: $output"
+}
+
+@test "loop_count_pre_increment_for_resume preserves loop numbering after increment" {
+    run loop_count_pre_increment_for_resume "8"
+    assert_success
+    assert_equal "$output" "7"
+
+    local next_loop=$((output + 1))
+    assert_equal "$next_loop" "8"
+}
+
+@test "rate limit recovery state preserves loop numbering" {
+    cat > .rate_limit_loop << 'EOF'
+{"mode":"rate_limit_wait","wait_until":123,"loop_count":8}
+EOF
+
+    local saved_loop_count
+    saved_loop_count=$(jq -r '.loop_count' .rate_limit_loop)
+
+    run loop_count_pre_increment_for_resume "$saved_loop_count"
+    assert_success
+
+    local next_loop=$((output + 1))
+    assert_equal "$next_loop" "8"
 }

@@ -9,10 +9,10 @@
     "test": "tests"
   },
   "scripts": {
-    "test": "bats tests/unit/ tests/integration/",
-    "test:unit": "bats tests/unit/",
-    "test:integration": "bats tests/integration/",
-    "test:e2e": "bats tests/e2e/"
+    "test": "bash -c 'BATS_BIN=./node_modules/.bin/bats; if [ -x \"$BATS_BIN\" ]; then \"$BATS_BIN\" tests/unit/ tests/integration/; elif command -v bats >/dev/null 2>&1; then bats tests/unit/ tests/integration/; else echo \"Error: bats not found. Install with: cd tools/ralph && pnpm install (network) OR brew install bats-core\" >&2; exit 127; fi'",
+    "test:unit": "bash -c 'BATS_BIN=./node_modules/.bin/bats; if [ -x \"$BATS_BIN\" ]; then \"$BATS_BIN\" tests/unit/; elif command -v bats >/dev/null 2>&1; then bats tests/unit/; else echo \"Error: bats not found. Install with: cd tools/ralph && pnpm install (network) OR brew install bats-core\" >&2; exit 127; fi'",
+    "test:integration": "bash -c 'BATS_BIN=./node_modules/.bin/bats; if [ -x \"$BATS_BIN\" ]; then \"$BATS_BIN\" tests/integration/; elif command -v bats >/dev/null 2>&1; then bats tests/integration/; else echo \"Error: bats not found. Install with: cd tools/ralph && pnpm install (network) OR brew install bats-core\" >&2; exit 127; fi'",
+    "test:e2e": "bash -c 'BATS_BIN=./node_modules/.bin/bats; if [ -x \"$BATS_BIN\" ]; then \"$BATS_BIN\" tests/e2e/; elif command -v bats >/dev/null 2>&1; then bats tests/e2e/; else echo \"Error: bats not found. Install with: cd tools/ralph && pnpm install (network) OR brew install bats-core\" >&2; exit 127; fi'"
   },
   "repository": {
     "type": "git",

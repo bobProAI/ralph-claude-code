@@ -16,6 +16,10 @@ STATE_DIR="."  # Default: current directory (preserves existing behavior)
 PROMPT_FILE="PROMPT.md"
 FIX_PLAN_FILE="@fix_plan.md"  # Default fix plan location
 AUTONOMOUS_MODE=false  # CP-016.26: When true, auto-wait on rate limit instead of prompting
+FOCUS_FIX_PLAN="${FOCUS_FIX_PLAN:-true}"  # When true, append remaining fix-plan items to the system prompt
+FIX_PLAN_FOCUS_MAX_ITEMS="${FIX_PLAN_FOCUS_MAX_ITEMS:-12}"
+FIX_PLAN_FOCUS_MAX_CHARS="${FIX_PLAN_FOCUS_MAX_CHARS:-1200}"
+RESET_REVIEW_STATE=false
 # Note: These paths are relative to STATE_DIR - they will be prefixed after arg parsing
 LOG_DIR_NAME="logs"
 DOCS_DIR_NAME="docs/generated"
@@ -38,6 +42,13 @@ CLAUDE_USE_CONTINUE=true                 # Enable session continuity
 CLAUDE_SESSION_FILE_NAME=".claude_session_id" # Session ID persistence file (prefixed with STATE_DIR)
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
 CLAUDE_MCP_CONFIG=""                     # Path to .mcp.json for MCP server configuration
+CLAUDE_PERMISSION_MODE="${CLAUDE_PERMISSION_MODE:-}"        # Optional Claude CLI permission mode override
+CODEX_REVIEW_ONLY="${CODEX_REVIEW_ONLY:-false}"            # When true, only allow Codex MCP tool
+CODEX_CONTEXT_FILE="${CODEX_CONTEXT_FILE:-}"               # Optional file list for Codex context bundle
+CODEX_CONTEXT_MAX_LINES="${CODEX_CONTEXT_MAX_LINES:-200}"
+CODEX_CONTEXT_MAX_CHARS="${CODEX_CONTEXT_MAX_CHARS:-2000}"
+CODEX_CONTEXT_TOTAL_MAX_CHARS="${CODEX_CONTEXT_TOTAL_MAX_CHARS:-8000}"
+REVIEW_ONLY_RETRY_DONE="${REVIEW_ONLY_RETRY_DONE:-false}"
 
 # Session management configuration (Phase 1.2)
 # Note: SESSION_EXPIRATION_SECONDS is defined in lib/response_analyzer.sh (86400 = 24 hours)
@@ -74,6 +85,9 @@ ALLOWED_BASH_PATTERNS=(
 
 # Exit detection configuration
 EXIT_SIGNALS_FILE_NAME=".exit_signals"  # Prefixed with STATE_DIR after arg parsing
+FIX_PLAN_FOCUS_STATE_FILE_NAME=".fix_plan_focus_state.json"
+REVIEW_STATE_FILE_NAME=".review_state.json"
+FIX_PLAN_PROGRESS_FILE_NAME=".fix_plan_progress.json"
 MAX_CONSECUTIVE_TEST_LOOPS=3
 MAX_CONSECUTIVE_DONE_SIGNALS=2
 TEST_PERCENTAGE_THRESHOLD=30  # If more than 30% of recent loops are test-only, flag it
@@ -108,6 +122,9 @@ setup_state_paths() {
     RALPH_SESSION_FILE="$STATE_DIR/$RALPH_SESSION_FILE_NAME"
     RALPH_SESSION_HISTORY_FILE="$STATE_DIR/$RALPH_SESSION_HISTORY_FILE_NAME"
     EXIT_SIGNALS_FILE="$STATE_DIR/$EXIT_SIGNALS_FILE_NAME"
+    FIX_PLAN_FOCUS_STATE_FILE="$STATE_DIR/$FIX_PLAN_FOCUS_STATE_FILE_NAME"
+    REVIEW_STATE_FILE="$STATE_DIR/$REVIEW_STATE_FILE_NAME"
+    FIX_PLAN_PROGRESS_FILE="$STATE_DIR/$FIX_PLAN_PROGRESS_FILE_NAME"
     CB_STATE_FILE="$STATE_DIR/.circuit_breaker_state"
     CB_HISTORY_FILE="$STATE_DIR/.circuit_breaker_history"
     RESPONSE_ANALYSIS_FILE="$STATE_DIR/.response_analysis"
@@ -283,8 +300,12 @@ wait_for_reset() {
     log_status "WARN" "Rate limit reached ($calls_made/$MAX_CALLS_PER_HOUR). Waiting for reset..."
     
     # Calculate time until next hour
-    local current_minute=$(date +%M)
-    local current_second=$(date +%S)
+    local current_minute
+    current_minute=$(date +%M)
+    current_minute=$((10#$current_minute))
+    local current_second
+    current_second=$(date +%S)
+    current_second=$((10#$current_second))
     local wait_time=$(((60 - current_minute - 1) * 60 + (60 - current_second)))
     
     log_status "INFO" "Sleeping for $wait_time seconds until next hour..."
@@ -311,9 +332,51 @@ wait_for_reset() {
 should_exit_gracefully() {
     log_status "INFO" "DEBUG: Checking exit conditions..." >&2
 
+    # Pre-compute fix plan completion so EXIT_SIGNAL can be gated
+    local total_items=0
+    local completed_items=0
+    local deferred_items=0
+    local in_progress_items=0
+    local open_items=0
+    local fix_plan_complete="false"
+    local mcp_calls=0
+    local mcp_denied=0
+    local mcp_required="true"
+    local mcp_ready="false"
+
+    if [[ -f "$FIX_PLAN_FILE" ]]; then
+        local IFS=$' \t\n'
+        read -r total_items completed_items deferred_items in_progress_items open_items <<< "$(get_fix_plan_counts)"
+
+        log_status "INFO" "DEBUG: $FIX_PLAN_FILE check - total:$total_items, done:$completed_items, deferred:$deferred_items, in_progress:$in_progress_items, open:$open_items" >&2
+
+        if [[ $total_items -gt 0 ]] && [[ $((completed_items + deferred_items)) -eq $total_items ]]; then
+            fix_plan_complete="true"
+        fi
+    else
+        log_status "INFO" "DEBUG: $FIX_PLAN_FILE file not found" >&2
+    fi
+
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        mcp_calls=$(jq -r '.analysis.mcp_calls // .mcp_calls // 0' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "0")
+        mcp_denied=$(jq -r '.analysis.mcp_denied // .mcp_denied // 0' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "0")
+    fi
+    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
+        mcp_calls=0
+    fi
+    if ! [[ "$mcp_denied" =~ ^[0-9]+$ ]]; then
+        mcp_denied=0
+    fi
+    if [[ "$mcp_calls" -gt 0 ]]; then
+        mcp_ready="true"
+    fi
+    if [[ "$mcp_calls" -le 0 && "$mcp_denied" -gt 0 ]]; then
+        log_status "WARN" "MCP tool call denied by permissions (mcp_denied=$mcp_denied)" >&2
+    fi
+
     # CP-016.26: PRIORITY 1 - Check Claude's explicit EXIT_SIGNAL first
     # This is the authoritative signal from Claude's RALPH_STATUS block.
-    # If Claude says EXIT_SIGNAL: true, we exit immediately - no heuristics needed.
+    # If Claude says EXIT_SIGNAL: true, we exit only when the fix plan is complete.
     local claude_exit_signal="false"
     if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
         # Check both .analysis.exit_signal and .exit_signal (different formats)
@@ -321,9 +384,23 @@ should_exit_gracefully() {
     fi
 
     if [[ "$claude_exit_signal" == "true" ]]; then
-        log_status "SUCCESS" "Exit condition: Claude explicit EXIT_SIGNAL=true in RALPH_STATUS block"
-        echo "exit_signal"
-        return 0
+        if [[ "$open_items" -gt 0 ]]; then
+            local fix_plan_changed
+            fix_plan_changed=$(fix_plan_changed_since_last)
+            if [[ "$fix_plan_changed" == "false" ]]; then
+                log_status "WARN" "Exit signal ignored: no fix_plan progress since last loop (open=$open_items)" >&2
+            fi
+        fi
+        if [[ "$fix_plan_complete" == "true" ]]; then
+            if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
+                log_status "WARN" "Exit signal ignored: no MCP usage detected (mcp_calls=$mcp_calls)" >&2
+            else
+                log_status "SUCCESS" "Exit condition: Claude explicit EXIT_SIGNAL=true in RALPH_STATUS block"
+                echo "exit_signal"
+                return 0
+            fi
+        fi
+        log_status "WARN" "Exit signal ignored: fix plan incomplete (done+deferred=$((completed_items + deferred_items))/$total_items)" >&2
     fi
 
     if [[ ! -f "$EXIT_SIGNALS_FILE" ]]; then
@@ -356,36 +433,35 @@ should_exit_gracefully() {
 
     # 3. Multiple "done" signals
     if [[ $recent_done_signals -ge $MAX_CONSECUTIVE_DONE_SIGNALS ]]; then
-        log_status "WARN" "Exit condition: Multiple completion signals ($recent_done_signals >= $MAX_CONSECUTIVE_DONE_SIGNALS)"
-        echo "completion_signals"
-        return 0
+        if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
+            log_status "WARN" "Exit condition met but blocked (no MCP usage): completion signals ($recent_done_signals >= $MAX_CONSECUTIVE_DONE_SIGNALS)" >&2
+        else
+            log_status "WARN" "Exit condition: Multiple completion signals ($recent_done_signals >= $MAX_CONSECUTIVE_DONE_SIGNALS)"
+            echo "completion_signals"
+            return 0
+        fi
     fi
 
     # 4. Strong completion indicators (backup heuristic)
     if [[ $recent_completion_indicators -ge 3 ]]; then
-        log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators >= 3)" >&2
-        echo "project_complete"
-        return 0
+        if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
+            log_status "WARN" "Exit condition met but blocked (no MCP usage): completion indicators ($recent_completion_indicators >= 3)" >&2
+        else
+            log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators >= 3)" >&2
+            echo "project_complete"
+            return 0
+        fi
     fi
     
     # 4. Check fix_plan.md for completion
-    if [[ -f "$FIX_PLAN_FILE" ]]; then
-        local total_items=$(grep -c "^- \[" "$FIX_PLAN_FILE" 2>/dev/null)
-        local completed_items=$(grep -c "^- \[x\]" "$FIX_PLAN_FILE" 2>/dev/null)
-        
-        # Handle case where grep returns no matches (exit code 1)
-        [[ -z "$total_items" ]] && total_items=0
-        [[ -z "$completed_items" ]] && completed_items=0
-        
-        log_status "INFO" "DEBUG: $FIX_PLAN_FILE check - total_items:$total_items, completed_items:$completed_items" >&2
-        
-        if [[ $total_items -gt 0 ]] && [[ $completed_items -eq $total_items ]]; then
-            log_status "WARN" "Exit condition: All fix_plan.md items completed ($completed_items/$total_items)" >&2
+    if [[ "$fix_plan_complete" == "true" ]]; then
+        if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
+            log_status "WARN" "Exit condition met but blocked (no MCP usage): fix plan complete (done+deferred=$((completed_items + deferred_items))/$total_items)" >&2
+        else
+            log_status "WARN" "Exit condition: All fix_plan.md items completed ($((completed_items + deferred_items))/$total_items)" >&2
             echo "plan_complete"
             return 0
         fi
-    else
-        log_status "INFO" "DEBUG: $FIX_PLAN_FILE file not found" >&2
     fi
     
     log_status "INFO" "DEBUG: No exit conditions met, continuing loop" >&2
@@ -507,14 +583,25 @@ validate_allowed_tools() {
 build_loop_context() {
     local loop_count=$1
     local context=""
+    local incomplete_tasks=0
 
     # Add loop number
     context="Loop #${loop_count}. "
 
     # Extract incomplete tasks from fix plan
     if [[ -f "$FIX_PLAN_FILE" ]]; then
-        local incomplete_tasks=$(grep -c "^- \[ \]" "$FIX_PLAN_FILE" 2>/dev/null || echo "0")
+        incomplete_tasks=$({ grep -c "^- \\[ \\]" "$FIX_PLAN_FILE" 2>/dev/null || true; } | head -n1)
+        [[ -z "$incomplete_tasks" ]] && incomplete_tasks=0
         context+="Remaining tasks: ${incomplete_tasks}. "
+
+        local total_items completed_items deferred_items in_progress_items open_items
+        read -r total_items completed_items deferred_items in_progress_items open_items <<< "$(get_fix_plan_counts)"
+        local review_count
+        review_count=$(get_review_state_count)
+        if [[ $total_items -gt 0 && $((completed_items + deferred_items)) -eq $total_items && "$review_count" == "0" ]]; then
+            echo "Loop #${loop_count}. Remaining tasks: ${incomplete_tasks}. Codex review pending. Call mcp__codex__codex now; do not claim COMPLETE without MCP review."
+            return 0
+        fi
     fi
 
     # Add circuit breaker state
@@ -551,13 +638,24 @@ get_session_file_age_hours() {
     local os_type
     os_type=$(uname)
 
-    local file_mtime
+    local file_mtime=""
     if [[ "$os_type" == "Darwin" ]]; then
-        # macOS (BSD stat)
-        file_mtime=$(stat -f %m "$file" 2>/dev/null)
+        # macOS (BSD stat), with GNU fallback in case coreutils stat is on PATH
+        file_mtime=$(stat -f %m "$file" 2>/dev/null || true)
+        if ! [[ "$file_mtime" =~ ^[0-9]+$ ]]; then
+            file_mtime=$(stat -c %Y "$file" 2>/dev/null || true)
+        fi
     else
-        # Linux (GNU stat)
-        file_mtime=$(stat -c %Y "$file" 2>/dev/null)
+        # Linux (GNU stat), with BSD fallback if needed
+        file_mtime=$(stat -c %Y "$file" 2>/dev/null || true)
+        if ! [[ "$file_mtime" =~ ^[0-9]+$ ]]; then
+            file_mtime=$(stat -f %m "$file" 2>/dev/null || true)
+        fi
+    fi
+
+    # Ensure we only use numeric mtimes to avoid arithmetic parsing issues
+    if ! [[ "$file_mtime" =~ ^[0-9]+$ ]]; then
+        file_mtime=""
     fi
 
     # Handle stat failure - return -1 to indicate error
@@ -645,6 +743,19 @@ save_claude_session() {
 # CP-016.26: AUTONOMOUS MODE HELPER FUNCTIONS
 # =============================================================================
 
+# Resume semantics:
+# The main loop increments `loop_count` at the top of each iteration.
+# To resume loop N (without changing numbering), set `loop_count` to N-1 before continuing.
+loop_count_pre_increment_for_resume() {
+    local saved_loop_count="$1"
+
+    if [[ "$saved_loop_count" =~ ^[0-9]+$ ]] && [[ "$saved_loop_count" -gt 0 ]]; then
+        echo $((saved_loop_count - 1))
+    else
+        echo "0"
+    fi
+}
+
 # Calculate wait time from rate limit error message
 # Error format: "You've hit your limit · resets 11pm (America/New_York)"
 # Also supports: "resets 11:30pm (America/New_York)" with optional minutes
@@ -663,30 +774,40 @@ calculate_wait_time() {
         local ampm="${BASH_REMATCH[4]}"
         local tz="${BASH_REMATCH[5]}"
 
+        # Normalize parsed values
+        tz="${tz//$'\r'/}"
+        hour=$((10#$hour))
+        minute=$((10#$minute))
+
         # Convert to 24-hour format
         if [[ "$ampm" == "pm" && "$hour" != "12" ]]; then
             hour=$((hour + 12))
         elif [[ "$ampm" == "am" && "$hour" == "12" ]]; then
             hour=0
         fi
+        printf -v hour "%02d" "$hour"
+        printf -v minute "%02d" "$minute"
 
         # Get current time in the specified timezone
         current_epoch=$(TZ="$tz" date +%s 2>/dev/null)
 
         # Calculate reset epoch (today at reset hour, or tomorrow if past)
-        # Use GNU/BSD-compatible date handling
-        os_type=$(uname)
-        if [[ "$os_type" == "Darwin" ]]; then
-            # macOS (BSD date)
-            reset_epoch=$(TZ="$tz" date -j -f "%H:%M" "$hour:$minute" +%s 2>/dev/null)
-        else
-            # Linux (GNU date)
-            reset_epoch=$(TZ="$tz" date -d "today $hour:$minute" +%s 2>/dev/null)
+        # Use a dated timestamp to avoid platform quirks with time-only parsing.
+        local date_str=""
+        date_str=$(TZ="$tz" date +%Y-%m-%d 2>/dev/null)
+        if [[ -n "$date_str" ]]; then
+            if reset_epoch=$(TZ="$tz" date -j -f "%Y-%m-%d %H:%M" "$date_str $hour:$minute" +%s 2>/dev/null); then
+                :
+            elif reset_epoch=$(TZ="$tz" date -d "$date_str $hour:$minute" +%s 2>/dev/null); then
+                :
+            elif command -v gdate >/dev/null 2>&1; then
+                reset_epoch=$(TZ="$tz" gdate -d "$date_str $hour:$minute" +%s 2>/dev/null)
+            fi
         fi
 
         # If reset time calculation failed, use fallback
         if [[ -z "$reset_epoch" ]]; then
-            log_status "WARN" "Failed to calculate reset time, using 60-minute fallback"
+            log_status "WARN" "Failed to calculate reset time, using 60-minute fallback" >&2
             echo "3600"
             return
         fi
@@ -701,13 +822,565 @@ calculate_wait_time() {
         # Add 5-minute buffer for safety
         wait_seconds=$((wait_seconds + 300))
 
-        log_status "INFO" "Calculated wait time: $((wait_seconds / 60)) minutes until reset"
+        log_status "INFO" "Calculated wait time: $((wait_seconds / 60)) minutes until reset" >&2
         echo "$wait_seconds"
     else
         # Fallback to 60 minutes if parsing fails
-        log_status "WARN" "Could not parse reset time from error message, using 60-minute fallback"
+        log_status "WARN" "Could not parse reset time from error message, using 60-minute fallback" >&2
         echo "3600"
     fi
+}
+
+# Get fix plan counts: total, completed, deferred, in_progress, open
+get_fix_plan_counts() {
+    if [[ ! -f "$FIX_PLAN_FILE" ]]; then
+        echo "0 0 0 0 0"
+        return 0
+    fi
+
+    local total_items completed_items deferred_items in_progress_items open_items
+    total_items=$({ grep -cE "^[[:space:]]*[-*][[:space:]]+\\[[^]]\\]" "$FIX_PLAN_FILE" 2>/dev/null || true; } | head -n1)
+    completed_items=$({ grep -cE "^[[:space:]]*[-*][[:space:]]+\\[[xX]\\]" "$FIX_PLAN_FILE" 2>/dev/null || true; } | head -n1)
+    deferred_items=$({ grep -cE "^[[:space:]]*[-*][[:space:]]+\\[[dD]\\]" "$FIX_PLAN_FILE" 2>/dev/null || true; } | head -n1)
+    in_progress_items=$({ grep -cE "^[[:space:]]*[-*][[:space:]]+\\[~\\]" "$FIX_PLAN_FILE" 2>/dev/null || true; } | head -n1)
+    open_items=$({ grep -cE "^[[:space:]]*[-*][[:space:]]+\\[[[:space:]]\\]" "$FIX_PLAN_FILE" 2>/dev/null || true; } | head -n1)
+
+    [[ -z "$total_items" ]] && total_items=0
+    [[ -z "$completed_items" ]] && completed_items=0
+    [[ -z "$deferred_items" ]] && deferred_items=0
+    [[ -z "$in_progress_items" ]] && in_progress_items=0
+    [[ -z "$open_items" ]] && open_items=0
+
+    echo "$total_items $completed_items $deferred_items $in_progress_items $open_items"
+}
+
+get_fix_plan_signature() {
+    if [[ ! -f "$FIX_PLAN_FILE" ]]; then
+        echo ""
+        return 0
+    fi
+
+    local sig=""
+    sig=$(cksum "$FIX_PLAN_FILE" 2>/dev/null | awk '{print $1 "-" $2}' || true)
+    echo "$sig"
+}
+
+get_fix_plan_progress_signature() {
+    local sig=""
+    if [[ -f "$FIX_PLAN_PROGRESS_FILE" ]]; then
+        sig=$(jq -r '.signature // ""' "$FIX_PLAN_PROGRESS_FILE" 2>/dev/null || echo "")
+    fi
+    echo "$sig"
+}
+
+fix_plan_changed_since_last() {
+    local current_sig
+    current_sig=$(get_fix_plan_signature)
+    local prev_sig
+    prev_sig=$(get_fix_plan_progress_signature)
+
+    if [[ -z "$current_sig" || -z "$prev_sig" ]]; then
+        echo "unknown"
+        return 0
+    fi
+
+    if [[ "$current_sig" != "$prev_sig" ]]; then
+        echo "true"
+    else
+        echo "false"
+    fi
+}
+
+update_fix_plan_progress_state() {
+    local loop_number=$1
+    local current_sig
+    current_sig=$(get_fix_plan_signature)
+    local prev_sig
+    prev_sig=$(get_fix_plan_progress_signature)
+
+    if [[ -z "$current_sig" ]]; then
+        return 0
+    fi
+
+    local ts
+    ts=$(get_iso_timestamp)
+    local last_changed_loop
+    last_changed_loop=$(jq -r '.last_changed_loop // 0' "$FIX_PLAN_PROGRESS_FILE" 2>/dev/null || echo "0")
+    local last_changed_ts
+    last_changed_ts=$(jq -r '.last_changed_ts // ""' "$FIX_PLAN_PROGRESS_FILE" 2>/dev/null || echo "")
+
+    local changed="false"
+    if [[ -z "$prev_sig" || "$current_sig" != "$prev_sig" ]]; then
+        changed="true"
+        last_changed_loop=$loop_number
+        last_changed_ts=$ts
+    fi
+
+    jq -n \
+        --arg signature "$current_sig" \
+        --arg last_seen_ts "$ts" \
+        --argjson last_seen_loop "$loop_number" \
+        --arg last_changed_ts "$last_changed_ts" \
+        --argjson last_changed_loop "$last_changed_loop" \
+        '{
+            signature: $signature,
+            last_seen_ts: $last_seen_ts,
+            last_seen_loop: $last_seen_loop,
+            last_changed_ts: $last_changed_ts,
+            last_changed_loop: $last_changed_loop
+        }' > "$FIX_PLAN_PROGRESS_FILE" 2>/dev/null || true
+}
+
+# Review state helpers
+get_review_state_count() {
+    local count=0
+    if [[ -f "$REVIEW_STATE_FILE" ]]; then
+        count=$(jq -r '.review_count // 0' "$REVIEW_STATE_FILE" 2>/dev/null || echo "0")
+    fi
+    if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+        count=0
+    fi
+    echo "$count"
+}
+
+review_marker_present() {
+    local analysis_file=$1
+    local summary=""
+    summary=$(jq -r '.analysis.work_summary // .work_summary // ""' "$analysis_file" 2>/dev/null || echo "")
+    if [[ -n "$summary" ]] && echo "$summary" | grep -qiE 'review[[:space:]]*[0-9]+|codex review|review verdict'; then
+        return 0
+    fi
+
+    local output_file=""
+    local stderr_file=""
+    output_file=$(jq -r '.output_file // empty' "$analysis_file" 2>/dev/null || echo "")
+    if [[ -n "$output_file" && -f "$output_file" ]]; then
+        if grep -qiE 'REVIEW VERDICT|Codex Review|Review[[:space:]]*[0-9]+' "$output_file"; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+parse_review_verdict() {
+    local output_file=$1
+    local verdict=""
+    if [[ -n "$output_file" && -f "$output_file" ]]; then
+        verdict=$(grep -Eo 'REVIEW_VERDICT:[[:space:]]*[A-Za-z_]+' "$output_file" 2>/dev/null | tail -1 | awk -F':' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')
+    fi
+    if [[ -z "$verdict" ]]; then
+        verdict="unknown"
+    fi
+    echo "$verdict"
+}
+
+save_review_state() {
+    local count=$1
+    local verdict=$2
+    local session_id=$3
+    local output_uuid=${4:-}
+    local ts
+    ts=$(get_iso_timestamp)
+
+    jq -n \
+        --argjson review_count "$count" \
+        --arg last_review_ts "$ts" \
+        --arg last_verdict "$verdict" \
+        --arg last_session_id "$session_id" \
+        --arg last_output_uuid "$output_uuid" \
+        '{
+            review_count: $review_count,
+            last_review_ts: $last_review_ts,
+            last_verdict: $last_verdict,
+            last_session_id: $last_session_id,
+            last_output_uuid: $last_output_uuid
+        }' > "$REVIEW_STATE_FILE" 2>/dev/null || true
+}
+
+update_review_state_from_analysis() {
+    local analysis_file=$1
+    if [[ ! -f "$analysis_file" ]]; then
+        return 0
+    fi
+
+    local mcp_calls=0
+    mcp_calls=$(jq -r '.analysis.mcp_calls // .mcp_calls // 0' "$analysis_file" 2>/dev/null || echo "0")
+    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
+        mcp_calls=0
+    fi
+    if [[ "$mcp_calls" -le 0 ]]; then
+        if review_marker_present "$analysis_file"; then
+            log_status "WARN" "Review claim detected without MCP usage; ignoring review state update" >&2
+        fi
+        return 0
+    fi
+
+    if [[ "$CODEX_REVIEW_ONLY" != "true" ]]; then
+        if ! review_marker_present "$analysis_file"; then
+            return 0
+        fi
+    fi
+
+    local output_file=""
+    output_file=$(jq -r '.output_file // empty' "$analysis_file" 2>/dev/null || echo "")
+    local session_id=""
+    local output_uuid=""
+    if [[ -n "$output_file" && -f "$output_file" ]]; then
+        session_id=$(jq -r '.session_id // .metadata.session_id // .sessionId // empty' "$output_file" 2>/dev/null || echo "")
+        output_uuid=$(jq -r '.uuid // empty' "$output_file" 2>/dev/null || echo "")
+        if [[ -z "$output_uuid" || "$output_uuid" == "null" ]]; then
+            output_uuid="$output_file"
+        fi
+    fi
+
+    local last_output_uuid=""
+    if [[ -f "$REVIEW_STATE_FILE" ]]; then
+        last_output_uuid=$(jq -r '.last_output_uuid // ""' "$REVIEW_STATE_FILE" 2>/dev/null || echo "")
+    fi
+    if [[ -n "$output_uuid" && "$output_uuid" == "$last_output_uuid" ]]; then
+        return 0
+    fi
+
+    local current_count
+    current_count=$(get_review_state_count)
+    local new_count=$((current_count + 1))
+    local verdict
+    verdict=$(parse_review_verdict "$output_file")
+    save_review_state "$new_count" "$verdict" "$session_id" "$output_uuid"
+}
+
+augment_mcp_usage_from_stderr() {
+    local analysis_file=$1
+    local stderr_file=$2
+    if [[ ! -f "$analysis_file" || -z "$stderr_file" || ! -f "$stderr_file" ]]; then
+        return 0
+    fi
+
+    local current_mcp_calls=0
+    current_mcp_calls=$(jq -r '.analysis.mcp_calls // .mcp_calls // 0' "$analysis_file" 2>/dev/null || echo "0")
+    if ! [[ "$current_mcp_calls" =~ ^[0-9]+$ ]]; then
+        current_mcp_calls=0
+    fi
+
+    local inferred_mcp_calls=0
+    inferred_mcp_calls=$(grep -oE 'mcp__codex__codex(-reply)?' "$stderr_file" 2>/dev/null | wc -l | tr -d ' ')
+    if ! [[ "$inferred_mcp_calls" =~ ^[0-9]+$ ]]; then
+        inferred_mcp_calls=0
+    fi
+
+    if [[ "$inferred_mcp_calls" -le 0 ]]; then
+        # MCP debug logs commonly include raw JSON-RPC method names (tools/call).
+        inferred_mcp_calls=$(grep -cE 'tools/call' "$stderr_file" 2>/dev/null | tr -d ' ' || echo "0")
+        if ! [[ "$inferred_mcp_calls" =~ ^[0-9]+$ ]]; then
+            inferred_mcp_calls=0
+        fi
+    fi
+
+    local updated=""
+    if [[ "$current_mcp_calls" -le 0 && "$inferred_mcp_calls" -gt 0 ]]; then
+        updated=$(jq \
+            --arg stderr_file "$stderr_file" \
+            --argjson mcp_calls "$inferred_mcp_calls" \
+            '.stderr_file = $stderr_file
+            | .analysis.stderr_file = $stderr_file
+            | .mcp_calls = $mcp_calls
+            | .analysis.mcp_calls = $mcp_calls' \
+            "$analysis_file" 2>/dev/null || echo "")
+        if [[ -n "$updated" ]]; then
+            echo "$updated" > "$analysis_file"
+            log_status "INFO" "MCP usage detected via stderr (mcp_calls=$inferred_mcp_calls)" >&2
+        fi
+    else
+        updated=$(jq \
+            --arg stderr_file "$stderr_file" \
+            '.stderr_file = $stderr_file
+            | .analysis.stderr_file = $stderr_file' \
+            "$analysis_file" 2>/dev/null || echo "")
+        if [[ -n "$updated" ]]; then
+            echo "$updated" > "$analysis_file"
+        fi
+    fi
+
+    return 0
+}
+
+enforce_mcp_review_only() {
+    local analysis_file=$1
+    if [[ "$CODEX_REVIEW_ONLY" != "true" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$analysis_file" ]]; then
+        return 0
+    fi
+
+    local mcp_calls=0
+    local mcp_denied=0
+    mcp_calls=$(jq -r '.analysis.mcp_calls // .mcp_calls // 0' "$analysis_file" 2>/dev/null || echo "0")
+    mcp_denied=$(jq -r '.analysis.mcp_denied // .mcp_denied // 0' "$analysis_file" 2>/dev/null || echo "0")
+    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
+        mcp_calls=0
+    fi
+    if ! [[ "$mcp_denied" =~ ^[0-9]+$ ]]; then
+        mcp_denied=0
+    fi
+
+    if [[ "$mcp_calls" -le 0 ]]; then
+        if [[ "$mcp_denied" -gt 0 ]]; then
+            log_status "ERROR" "Review-only mode failed: MCP call denied by permissions (mcp_denied=$mcp_denied)" >&2
+        else
+            log_status "ERROR" "Review-only mode failed: no MCP calls detected (mcp_calls=0)" >&2
+        fi
+        return 4
+    fi
+
+    return 0
+}
+
+warn_review_count_mismatch() {
+    local analysis_file=$1
+    if [[ ! -f "$analysis_file" ]]; then
+        return 0
+    fi
+
+    local output_file=""
+    output_file=$(jq -r '.output_file // empty' "$analysis_file" 2>/dev/null || echo "")
+    if [[ -z "$output_file" || ! -f "$output_file" ]]; then
+        return 0
+    fi
+
+    local reported=""
+    reported=$(grep -Eo 'REVIEW_COUNT:[[:space:]]*[0-9]+' "$output_file" 2>/dev/null | tail -1 | awk -F':' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}')
+    if [[ -z "$reported" ]]; then
+        return 0
+    fi
+
+    local state_count
+    state_count=$(get_review_state_count)
+    if [[ "$reported" != "$state_count" ]]; then
+        log_status "WARN" "REVIEW_COUNT mismatch: reported=$reported, state=$state_count" >&2
+    fi
+}
+
+warn_missing_codex_diff() {
+    local analysis_file=$1
+    if [[ ! -f "$analysis_file" ]]; then
+        return 0
+    fi
+
+    local output_file=""
+    output_file=$(jq -r '.output_file // empty' "$analysis_file" 2>/dev/null || echo "")
+    if [[ -z "$output_file" || ! -f "$output_file" ]]; then
+        return 0
+    fi
+
+    if ! grep -qi 'CODEX_PATCH_REQUESTED:[[:space:]]*true' "$output_file"; then
+        return 0
+    fi
+
+    if grep -qi 'CODEX_DIFF_RECEIVED:[[:space:]]*true' "$output_file"; then
+        return 0
+    fi
+
+    if grep -q '^diff --git' "$output_file" || grep -q '^--- a/' "$output_file" || grep -q '^+++ b/' "$output_file"; then
+        return 0
+    fi
+
+    log_status "WARN" "Codex patch requested but no unified diff detected; continue without blocking or re-request diff." >&2
+}
+
+# Build system prompt block with remaining fix-plan items (rotating window)
+build_fix_plan_focus_block() {
+    if [[ ! -f "$FIX_PLAN_FILE" ]]; then
+        log_status "INFO" "Focus fix plan enabled, but file not found: $FIX_PLAN_FILE" >&2
+        echo ""
+        return 0
+    fi
+
+    local total_items completed_items deferred_items in_progress_items open_items
+    local IFS=$' \t\n'
+    read -r total_items completed_items deferred_items in_progress_items open_items <<< "$(get_fix_plan_counts)"
+    local total_remaining=$((open_items + in_progress_items))
+
+    local remaining_items=()
+    local line=""
+    while IFS= read -r line; do
+        remaining_items+=("$line")
+    done < <(grep -E "^[[:space:]]*[-*][[:space:]]+\\[[[:space:]~]\\]" "$FIX_PLAN_FILE" 2>/dev/null || true)
+
+    if [[ $total_remaining -eq 0 ]]; then
+        log_status "INFO" "Focus fix plan enabled, but no unchecked items found" >&2
+        echo ""
+        return 0
+    fi
+
+    local plan_hash=""
+    plan_hash=$(cksum "$FIX_PLAN_FILE" 2>/dev/null | awk '{print $1 "-" $2}')
+    if [[ -z "$plan_hash" ]]; then
+        plan_hash="unknown"
+    fi
+
+    local window_offset=0
+    local stored_hash=""
+    local stored_deferred=0
+    if [[ -f "$FIX_PLAN_FOCUS_STATE_FILE" ]]; then
+        window_offset=$(jq -r '.window_offset // 0' "$FIX_PLAN_FOCUS_STATE_FILE" 2>/dev/null || echo "0")
+        stored_hash=$(jq -r '.plan_hash // ""' "$FIX_PLAN_FOCUS_STATE_FILE" 2>/dev/null || echo "")
+        stored_deferred=$(jq -r '.deferred_count // 0' "$FIX_PLAN_FOCUS_STATE_FILE" 2>/dev/null || echo "0")
+    fi
+
+    if ! [[ "$window_offset" =~ ^[0-9]+$ ]]; then
+        window_offset=0
+    fi
+    if ! [[ "$stored_deferred" =~ ^[0-9]+$ ]]; then
+        stored_deferred=0
+    fi
+    if [[ "$stored_hash" != "$plan_hash" ]]; then
+        window_offset=0
+    fi
+    if [[ $window_offset -ge $total_remaining ]]; then
+        window_offset=0
+    fi
+
+    local max_items="$FIX_PLAN_FOCUS_MAX_ITEMS"
+    if ! [[ "$max_items" =~ ^[0-9]+$ ]] || [[ "$max_items" -le 0 ]]; then
+        max_items=12
+    fi
+
+    local max_chars="$FIX_PLAN_FOCUS_MAX_CHARS"
+    if ! [[ "$max_chars" =~ ^[0-9]+$ ]] || [[ "$max_chars" -le 0 ]]; then
+        max_chars=1200
+    fi
+
+    local selected_items=()
+    local char_count=0
+    local scanned=0
+
+    while [[ $scanned -lt $total_remaining && ${#selected_items[@]} -lt $max_items ]]; do
+        local idx=$(( (window_offset + scanned) % total_remaining ))
+        local line="${remaining_items[$idx]}"
+        local line_len=${#line}
+
+        if [[ $char_count -gt 0 && $((char_count + line_len)) -gt $max_chars ]]; then
+            break
+        fi
+
+        selected_items+=("$line")
+        char_count=$((char_count + line_len))
+        scanned=$((scanned + 1))
+    done
+
+    if [[ ${#selected_items[@]} -eq 0 ]]; then
+        selected_items+=("${remaining_items[$window_offset]}")
+    fi
+
+    local selected_count=${#selected_items[@]}
+    local next_offset=$(( (window_offset + selected_count) % total_remaining ))
+    local ts
+    ts=$(get_iso_timestamp)
+
+    jq -n \
+        --argjson window_offset "$next_offset" \
+        --arg plan_hash "$plan_hash" \
+        --argjson total_remaining "$total_remaining" \
+        --argjson last_count "$selected_count" \
+        --argjson deferred_count "$deferred_items" \
+        --argjson open_count "$open_items" \
+        --argjson in_progress_count "$in_progress_items" \
+        --arg updated_at "$ts" \
+        '{
+            window_offset: $window_offset,
+            plan_hash: $plan_hash,
+            total_remaining: $total_remaining,
+            last_count: $last_count,
+            deferred_count: $deferred_count,
+            open_count: $open_count,
+            in_progress_count: $in_progress_count,
+            updated_at: $updated_at
+        }' > "$FIX_PLAN_FOCUS_STATE_FILE" 2>/dev/null || true
+
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        local summary_text=""
+        summary_text=$(jq -r '.analysis.work_summary // .work_summary // ""' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "")
+        if [[ -n "$summary_text" ]] && printf '%s' "$summary_text" | grep -qi "defer"; then
+            if [[ "$deferred_items" -le "$stored_deferred" ]]; then
+                log_status "WARN" "Deferral mentioned, but no new [d] items recorded in $FIX_PLAN_FILE" >&2
+            fi
+        fi
+    fi
+
+    local block="Remaining fix plan items (showing $selected_count of $total_remaining; rotating each loop)."
+    block+=$'\n'"Only work on unchecked items below; do not redo completed items."
+    block+=$'\n'"For each item listed, make a call this loop: either (1) take concrete action toward completion and update @fix_plan.md, or (2) mark it [d] with a reason and CP reference (e.g., [d] (defer to CP-017: visual emphasis))."
+    block+=$'\n'"Do not claim COMPLETE until every remaining item is [x] or [d]."
+    block+=$'\n'"Status counts: total=$total_items, done=$completed_items, deferred=$deferred_items, in_progress=$in_progress_items, open=$open_items."
+    for line in "${selected_items[@]}"; do
+        block+=$'\n'"$line"
+    done
+
+    echo "$block"
+}
+
+# Build an optional Codex context bundle from a file list.
+# File list should contain one path per line (relative or absolute).
+build_codex_context_block() {
+    if [[ -z "$CODEX_CONTEXT_FILE" ]]; then
+        echo ""
+        return 0
+    fi
+
+    if [[ ! -f "$CODEX_CONTEXT_FILE" ]]; then
+        log_status "WARN" "Codex context file not found: $CODEX_CONTEXT_FILE" >&2
+        echo ""
+        return 0
+    fi
+
+    local total_chars=0
+    local files_added=0
+    local block="Codex Context Bundle (auto-generated)\nUse these excerpts when preparing a Codex Patch Request.\n"
+
+    while IFS= read -r path; do
+        path=$(echo "$path" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -z "$path" || "$path" =~ ^# ]]; then
+            continue
+        fi
+        if [[ ! -f "$path" ]]; then
+            continue
+        fi
+
+        local content
+        content=$(sed -n "1,${CODEX_CONTEXT_MAX_LINES}p" "$path" | head -c "$CODEX_CONTEXT_MAX_CHARS")
+        if [[ -z "$content" ]]; then
+            continue
+        fi
+
+        local snippet="### $path\n$content\n"
+        local snippet_len=${#snippet}
+        if (( total_chars + snippet_len > CODEX_CONTEXT_TOTAL_MAX_CHARS )); then
+            local remaining=$((CODEX_CONTEXT_TOTAL_MAX_CHARS - total_chars))
+            if (( remaining <= 0 )); then
+                break
+            fi
+            snippet=$(printf "%s" "$snippet" | head -c "$remaining")
+            snippet_len=${#snippet}
+        fi
+
+        block+="$snippet\n"
+        total_chars=$((total_chars + snippet_len))
+        files_added=$((files_added + 1))
+
+        if (( total_chars >= CODEX_CONTEXT_TOTAL_MAX_CHARS )); then
+            break
+        fi
+    done < "$CODEX_CONTEXT_FILE"
+
+    if (( files_added == 0 )); then
+        echo ""
+        return 0
+    fi
+
+    log_status "INFO" "Codex context bundle built ($files_added files, ${total_chars} chars)" >&2
+    printf '%s\n' "$block"
 }
 
 # =============================================================================
@@ -910,6 +1583,9 @@ build_claude_command() {
     local prompt_file=$1
     local loop_context=$2
     local session_id=$3
+    local focus_block=""
+    local codex_context_block=""
+    local review_gate_block=""
 
     # Reset global array
     CLAUDE_CMD_ARGS=("$CLAUDE_CODE_CMD")
@@ -921,8 +1597,22 @@ build_claude_command() {
     fi
 
     # Add output format flag
+    # In review-only mode we need `stream-json` to reliably observe tool_use events.
     if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
-        CLAUDE_CMD_ARGS+=("--output-format" "json")
+        local cli_output_format="json"
+        if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+            cli_output_format="stream-json"
+        fi
+        CLAUDE_CMD_ARGS+=("--output-format" "$cli_output_format")
+        # Review-only runs should be fully deterministic and observable:
+        # - `--include-partial-messages` is required for tool_use events in stream-json output.
+        # - `--no-session-persistence` avoids anchoring on prior sessions and prevents writes.
+        # - Claude requires `--verbose` with `--print` + `--output-format=stream-json`.
+        if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+            CLAUDE_CMD_ARGS+=("--include-partial-messages")
+            CLAUDE_CMD_ARGS+=("--no-session-persistence")
+            CLAUDE_CMD_ARGS+=("--verbose")
+        fi
     fi
 
     # Add MCP server configuration if specified
@@ -934,13 +1624,23 @@ build_claude_command() {
             log_status "WARN" "MCP config file not found: $CLAUDE_MCP_CONFIG"
         fi
     fi
+    if [[ "$CODEX_REVIEW_ONLY" == "true" && -n "$CLAUDE_MCP_CONFIG" && -f "$CLAUDE_MCP_CONFIG" ]]; then
+        CLAUDE_CMD_ARGS+=("--strict-mcp-config")
+        CLAUDE_CMD_ARGS+=("--debug" "mcp")
+    fi
 
     # Add allowed tools (each tool as separate array element)
-    if [[ -n "$CLAUDE_ALLOWED_TOOLS" ]]; then
+    local effective_tools="$CLAUDE_ALLOWED_TOOLS"
+    if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+        # MCP tools are namespaced as mcp__<server>__<tool>
+        # Codex MCP server exposes `codex` and `codex-reply`.
+        effective_tools="mcp__codex__codex,mcp__codex__codex-reply"
+    fi
+    if [[ -n "$effective_tools" ]]; then
         CLAUDE_CMD_ARGS+=("--allowedTools")
         # Split by comma and add each tool
         local IFS=','
-        read -ra tools_array <<< "$CLAUDE_ALLOWED_TOOLS"
+        read -ra tools_array <<< "$effective_tools"
         for tool in "${tools_array[@]}"; do
             # Trim whitespace
             tool=$(echo "$tool" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -949,15 +1649,57 @@ build_claude_command() {
             fi
         done
     fi
+    if [[ -n "$CLAUDE_PERMISSION_MODE" ]]; then
+        CLAUDE_CMD_ARGS+=("--permission-mode" "$CLAUDE_PERMISSION_MODE")
+    fi
 
     # Add session continuity flag
-    if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
+    # Review-only runs must start fresh (avoid anchoring on prior "COMPLETE" sessions).
+    if [[ "$CLAUDE_USE_CONTINUE" == "true" && "$CODEX_REVIEW_ONLY" != "true" ]]; then
         CLAUDE_CMD_ARGS+=("--continue")
     fi
 
-    # Add loop context as system prompt (no escaping needed - array handles it)
+    if [[ "$FOCUS_FIX_PLAN" == "true" ]]; then
+        focus_block=$(build_fix_plan_focus_block)
+        if [[ -n "$focus_block" ]]; then
+            local focus_lines=0
+            focus_lines=$(printf '%s\n' "$focus_block" | wc -l | tr -d ' ')
+            log_status "INFO" "Focus fix plan block injected ($focus_lines lines, ${#focus_block} chars)" >&2
+        else
+            log_status "INFO" "Focus fix plan block empty" >&2
+        fi
+    fi
+    if [[ -n "$CODEX_CONTEXT_FILE" ]]; then
+        codex_context_block=$(build_codex_context_block)
+        if [[ -n "$codex_context_block" ]]; then
+            log_status "INFO" "Codex context block injected (${#codex_context_block} chars)" >&2
+        fi
+    fi
+
+    # Add system prompts (no escaping needed - array handles it)
     if [[ -n "$loop_context" ]]; then
         CLAUDE_CMD_ARGS+=("--append-system-prompt" "$loop_context")
+    fi
+    local review_count_block="Authoritative review_count: $(get_review_state_count). Use this value in RALPH_STATUS. Do not claim PASS or increment REVIEW_COUNT without a Codex MCP review."
+    CLAUDE_CMD_ARGS+=("--append-system-prompt" "$review_count_block")
+    if [[ -f "$FIX_PLAN_FILE" ]]; then
+        local IFS=$' \t\n'
+        local total_items completed_items deferred_items in_progress_items open_items
+        read -r total_items completed_items deferred_items in_progress_items open_items <<< "$(get_fix_plan_counts)"
+        if [[ $total_items -gt 0 && $((completed_items + deferred_items)) -eq $total_items ]]; then
+            if [[ "$(get_review_state_count)" == "0" ]]; then
+                review_gate_block="Codex review required now. Call mcp__codex__codex for Review 1. Do not claim COMPLETE or PASS without a Codex MCP review."
+            fi
+        fi
+    fi
+    if [[ -n "$review_gate_block" ]]; then
+        CLAUDE_CMD_ARGS+=("--append-system-prompt" "$review_gate_block")
+    fi
+    if [[ -n "$focus_block" ]]; then
+        CLAUDE_CMD_ARGS+=("--append-system-prompt" "$focus_block")
+    fi
+    if [[ -n "$codex_context_block" ]]; then
+        CLAUDE_CMD_ARGS+=("--append-system-prompt" "$codex_context_block")
     fi
 
     # Read prompt file content and use -p flag
@@ -970,19 +1712,16 @@ build_claude_command() {
 
 # Main execution function
 execute_claude_code() {
-    local timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
-    local output_file="$LOG_DIR/claude_output_${timestamp}.log"
     local loop_count=$1
     local calls_made=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
-    calls_made=$((calls_made + 1))
-
-    log_status "LOOP" "Executing Claude Code (Call $calls_made/$MAX_CALLS_PER_HOUR)"
     local timeout_seconds=$((CLAUDE_TIMEOUT_MINUTES * 60))
-    log_status "INFO" "⏳ Starting Claude Code execution... (timeout: ${CLAUDE_TIMEOUT_MINUTES}m)"
+    local extra_prompt=""
+    local strict_retry_prompt="Review-only enforcement: first action must be mcp__codex__codex. If you cannot, respond exactly 'FAIL: MCP_REQUIRED' and stop."
+    local output_file=""
 
     # Build loop context for session continuity
     local loop_context=""
-    if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
+    if [[ "$CLAUDE_USE_CONTINUE" == "true" && "$CODEX_REVIEW_ONLY" != "true" ]]; then
         loop_context=$(build_loop_context "$loop_count")
         if [[ -n "$loop_context" && "$VERBOSE_PROGRESS" == "true" ]]; then
             log_status "INFO" "Loop context: $loop_context"
@@ -991,75 +1730,102 @@ execute_claude_code() {
 
     # Initialize or resume session
     local session_id=""
-    if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
+    if [[ "$CLAUDE_USE_CONTINUE" == "true" && "$CODEX_REVIEW_ONLY" != "true" ]]; then
         session_id=$(init_claude_session)
     fi
 
-    # Build the Claude CLI command with modern flags
-    # Note: We use the modern CLI with -p flag when CLAUDE_OUTPUT_FORMAT is "json"
-    # For backward compatibility, fall back to stdin piping for text mode
-    local use_modern_cli=false
-
-    if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
-        # Modern approach: use CLI flags (builds CLAUDE_CMD_ARGS array)
-        if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id"; then
-            use_modern_cli=true
-            log_status "INFO" "Using modern CLI mode (JSON output)"
-        else
-            log_status "WARN" "Failed to build modern CLI command, falling back to legacy mode"
-        fi
-    else
-        log_status "INFO" "Using legacy CLI mode (text output)"
+    # In review-only mode, enforce the MCP call from the first attempt (no retries/anchoring).
+    if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+        extra_prompt="$strict_retry_prompt"
+        REVIEW_ONLY_RETRY_DONE="true"
     fi
 
-    # Execute Claude Code
-    if [[ "$use_modern_cli" == "true" ]]; then
-        # Modern execution with command array (shell-injection safe)
-        # Execute array directly without bash -c to prevent shell metacharacter interpretation
-        if timeout ${timeout_seconds}s "${CLAUDE_CMD_ARGS[@]}" > "$output_file" 2>&1 &
-        then
-            :  # Continue to wait loop
+    local attempt=0
+    local analysis_exit_code=0
+    while true; do
+        attempt=$((attempt + 1))
+        calls_made=$((calls_made + 1))
+
+        local timestamp
+        timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+        local attempt_suffix=""
+        if [[ $attempt -gt 1 ]]; then
+            attempt_suffix="_retry${attempt}"
+        fi
+        output_file="$LOG_DIR/claude_output_${timestamp}${attempt_suffix}.log"
+        stderr_file="$LOG_DIR/claude_output_${timestamp}${attempt_suffix}.stderr.log"
+
+        log_status "LOOP" "Executing Claude Code (Call $calls_made/$MAX_CALLS_PER_HOUR)"
+        log_status "INFO" "⏳ Starting Claude Code execution... (timeout: ${CLAUDE_TIMEOUT_MINUTES}m)"
+
+        # Build the Claude CLI command with modern flags
+        # Note: We use the modern CLI with -p flag when CLAUDE_OUTPUT_FORMAT is "json"
+        # For backward compatibility, fall back to stdin piping for text mode
+        local use_modern_cli=false
+
+        if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
+            # Modern approach: use CLI flags (builds CLAUDE_CMD_ARGS array)
+            if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id"; then
+                use_modern_cli=true
+                if [[ -n "$extra_prompt" ]]; then
+                    CLAUDE_CMD_ARGS+=("--append-system-prompt" "$extra_prompt")
+                fi
+                log_status "INFO" "Using modern CLI mode (JSON output)"
+            else
+                log_status "WARN" "Failed to build modern CLI command, falling back to legacy mode"
+            fi
         else
-            log_status "ERROR" "❌ Failed to start Claude Code process (modern mode)"
-            # Fall back to legacy mode
-            log_status "INFO" "Falling back to legacy mode..."
-            use_modern_cli=false
-        fi
-    fi
-
-    # Fall back to legacy stdin piping if modern mode failed or not enabled
-    if [[ "$use_modern_cli" == "false" ]]; then
-        if timeout ${timeout_seconds}s $CLAUDE_CODE_CMD < "$PROMPT_FILE" > "$output_file" 2>&1 &
-        then
-            :  # Continue to wait loop
-        else
-            log_status "ERROR" "❌ Failed to start Claude Code process"
-            return 1
-        fi
-    fi
-
-    # Get PID and monitor progress
-    local claude_pid=$!
-    local progress_counter=0
-
-    # Show progress while Claude Code is running
-    while kill -0 $claude_pid 2>/dev/null; do
-        progress_counter=$((progress_counter + 1))
-        case $((progress_counter % 4)) in
-            1) progress_indicator="⠋" ;;
-            2) progress_indicator="⠙" ;;
-            3) progress_indicator="⠹" ;;
-            0) progress_indicator="⠸" ;;
-        esac
-
-        # Get last line from output if available
-        local last_line=""
-        if [[ -f "$output_file" && -s "$output_file" ]]; then
-            last_line=$(tail -1 "$output_file" 2>/dev/null | head -c 80)
+            log_status "INFO" "Using legacy CLI mode (text output)"
         fi
 
-        # Update progress file for monitor
-        cat > "$PROGRESS_FILE" << EOF
+        # Execute Claude Code
+        if [[ "$use_modern_cli" == "true" ]]; then
+            # Modern execution with command array (shell-injection safe)
+            # Execute array directly without bash -c to prevent shell metacharacter interpretation
+            if timeout ${timeout_seconds}s "${CLAUDE_CMD_ARGS[@]}" > "$output_file" 2> "$stderr_file" &
+            then
+                :  # Continue to wait loop
+            else
+                log_status "ERROR" "❌ Failed to start Claude Code process (modern mode)"
+                # Fall back to legacy mode
+                log_status "INFO" "Falling back to legacy mode..."
+                use_modern_cli=false
+            fi
+        fi
+
+        # Fall back to legacy stdin piping if modern mode failed or not enabled
+        if [[ "$use_modern_cli" == "false" ]]; then
+            if timeout ${timeout_seconds}s $CLAUDE_CODE_CMD < "$PROMPT_FILE" > "$output_file" 2> "$stderr_file" &
+            then
+                :  # Continue to wait loop
+            else
+                log_status "ERROR" "❌ Failed to start Claude Code process"
+                return 1
+            fi
+        fi
+
+        # Get PID and monitor progress
+        local claude_pid=$!
+        local progress_counter=0
+
+        # Show progress while Claude Code is running
+        while kill -0 $claude_pid 2>/dev/null; do
+            progress_counter=$((progress_counter + 1))
+            case $((progress_counter % 4)) in
+                1) progress_indicator="⠋" ;;
+                2) progress_indicator="⠙" ;;
+                3) progress_indicator="⠹" ;;
+                0) progress_indicator="⠸" ;;
+            esac
+
+            # Get last line from output if available
+            local last_line=""
+            if [[ -f "$output_file" && -s "$output_file" ]]; then
+                last_line=$(tail -1 "$output_file" 2>/dev/null | head -c 80)
+            fi
+
+            # Update progress file for monitor
+            cat > "$PROGRESS_FILE" << EOF
 {
     "status": "executing",
     "indicator": "$progress_indicator",
@@ -1069,38 +1835,66 @@ execute_claude_code() {
 }
 EOF
 
-        # Only log if verbose mode is enabled
-        if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
-            if [[ -n "$last_line" ]]; then
-                log_status "INFO" "$progress_indicator Claude Code: $last_line... (${progress_counter}0s)"
+            # Only log if verbose mode is enabled
+            if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
+                if [[ -n "$last_line" ]]; then
+                    log_status "INFO" "$progress_indicator Claude Code: $last_line... (${progress_counter}0s)"
+                else
+                    log_status "INFO" "$progress_indicator Claude Code working... (${progress_counter}0s elapsed)"
+                fi
+            fi
+
+            sleep 10
+        done
+
+        # Wait for the process to finish and get exit code
+        wait $claude_pid
+        local exit_code=$?
+
+        # CP-016.26: Check for errors embedded in JSON response, even with non-zero exit codes
+        # Rate limit errors can come as {"is_error": true, "result": "You've hit your limit..."}
+        local rate_limit_detected="false"
+        local json_error_file="$output_file"
+        if ! jq empty "$json_error_file" >/dev/null 2>&1; then
+            if [[ -s "$stderr_file" ]] && jq empty "$stderr_file" >/dev/null 2>&1; then
+                json_error_file="$stderr_file"
+            fi
+        fi
+        if jq -e '.is_error == true' "$json_error_file" >/dev/null 2>&1; then
+            local error_msg
+            error_msg=$(jq -r '.result // "Unknown error"' "$json_error_file" 2>/dev/null)
+            if [[ "$error_msg" == *"limit"* ]] || [[ "$error_msg" == *"resets"* ]]; then
+                log_status "ERROR" "API rate limit detected in JSON response: $error_msg"
+                # Store error message for wait time calculation
+                echo "$error_msg" > "$STATE_DIR/.rate_limit_error"
+                rate_limit_detected="true"
+                exit_code=2  # Treat as rate limit error
             else
-                log_status "INFO" "$progress_indicator Claude Code working... (${progress_counter}0s elapsed)"
+                log_status "ERROR" "Claude returned error: $error_msg"
+                if [ $exit_code -eq 0 ]; then
+                    exit_code=1
+                fi
             fi
         fi
 
-        sleep 10
-    done
+        if [ $exit_code -ne 0 ]; then
+            # Clear progress file on failure
+            echo '{"status": "failed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
 
-    # Wait for the process to finish and get exit code
-    wait $claude_pid
-    local exit_code=$?
+            # Check if the failure is due to API 5-hour limit
+            if [[ "$rate_limit_detected" == "true" ]] || grep -qi "5.*hour.*limit\|limit.*reached.*try.*back\|usage.*limit.*reached" "$output_file" "$stderr_file" 2>/dev/null; then
+                log_status "ERROR" "🚫 Claude API 5-hour usage limit reached"
+                return 2  # Special return code for API limit
+            fi
 
-    # CP-016.26: Check for errors embedded in JSON response even with exit code 0
-    # Rate limit errors can come as {"is_error": true, "result": "You've hit your limit..."}
-    if [ $exit_code -eq 0 ] && jq -e '.is_error == true' "$output_file" >/dev/null 2>&1; then
-        local error_msg=$(jq -r '.result // "Unknown error"' "$output_file" 2>/dev/null)
-        if [[ "$error_msg" == *"limit"* ]] || [[ "$error_msg" == *"resets"* ]]; then
-            log_status "ERROR" "API rate limit detected in JSON response: $error_msg"
-            # Store error message for wait time calculation
-            echo "$error_msg" > "$STATE_DIR/.rate_limit_error"
-            exit_code=2  # Treat as rate limit error
-        else
-            log_status "ERROR" "Claude returned error: $error_msg"
-            exit_code=1
+            if [[ -s "$stderr_file" ]]; then
+                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file (stderr: $stderr_file)"
+            else
+                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
+            fi
+            return 1
         fi
-    fi
 
-    if [ $exit_code -eq 0 ]; then
         # Only increment counter on successful execution
         echo "$calls_made" > "$CALL_COUNT_FILE"
 
@@ -1117,13 +1911,51 @@ EOF
         # Analyze the response
         log_status "INFO" "🔍 Analyzing Claude Code response..."
         analyze_response "$output_file" "$loop_count" "$RESPONSE_ANALYSIS_FILE"
-        local analysis_exit_code=$?
+        analysis_exit_code=$?
+        augment_mcp_usage_from_stderr "$RESPONSE_ANALYSIS_FILE" "$stderr_file"
+
+        if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+            REVIEW_ONLY_RETRY_DONE="true"
+        fi
+        break
+    done
 
         # Update exit signals based on analysis
         update_exit_signals "$RESPONSE_ANALYSIS_FILE" "$EXIT_SIGNALS_FILE"
 
+        # Update review state based on MCP review signals
+        update_review_state_from_analysis "$RESPONSE_ANALYSIS_FILE"
+        warn_review_count_mismatch "$RESPONSE_ANALYSIS_FILE"
+        warn_missing_codex_diff "$RESPONSE_ANALYSIS_FILE"
+
         # Log analysis summary
         log_analysis_summary "$RESPONSE_ANALYSIS_FILE"
+
+        # Warn when Claude claims completion without fix-plan progress
+        if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+            local analysis_exit_signal="false"
+            analysis_exit_signal=$(jq -r '.analysis.exit_signal // .exit_signal // "false"' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "false")
+            if [[ "$analysis_exit_signal" == "true" ]]; then
+                local total_items completed_items deferred_items in_progress_items open_items
+                local IFS=$' \t\n'
+                read -r total_items completed_items deferred_items in_progress_items open_items <<< "$(get_fix_plan_counts)"
+                if [[ "$open_items" -gt 0 ]]; then
+                    local fix_plan_changed
+                    fix_plan_changed=$(fix_plan_changed_since_last)
+                    if [[ "$fix_plan_changed" == "false" ]]; then
+                        log_status "WARN" "Completion claimed but no fix_plan progress since last loop (open=$open_items)" >&2
+                    fi
+                fi
+            fi
+        fi
+
+        # Record fix plan progress signature for next loop comparison
+        update_fix_plan_progress_state "$loop_count"
+
+        # Enforce Codex MCP usage in review-only mode
+        if ! enforce_mcp_review_only "$RESPONSE_ANALYSIS_FILE"; then
+            return 4
+        fi
 
         # Get file change count for circuit breaker
         local files_changed=$(git diff --name-only 2>/dev/null | wc -l || echo 0)
@@ -1133,14 +1965,16 @@ EOF
         # Stage 1: Filter out JSON field patterns like "is_error": false
         # Stage 2: Look for actual error messages in specific contexts
         # Avoid type annotations like "error: Error" by requiring lowercase after ": error"
-        if grep -v '"[^"]*error[^"]*":' "$output_file" 2>/dev/null | \
+        if cat "$output_file" "$stderr_file" 2>/dev/null | \
+           grep -v '"[^"]*error[^"]*":' 2>/dev/null | \
            grep -qE '(^Error:|^ERROR:|^error:|\]: error|Link: error|Error occurred|failed with error|[Ee]xception|Fatal|FATAL)'; then
             has_errors="true"
 
             # Debug logging: show what triggered error detection
             if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
                 log_status "DEBUG" "Error patterns found:"
-                grep -v '"[^"]*error[^"]*":' "$output_file" 2>/dev/null | \
+                cat "$output_file" "$stderr_file" 2>/dev/null | \
+                    grep -v '"[^"]*error[^"]*":' 2>/dev/null | \
                     grep -nE '(^Error:|^ERROR:|^error:|\]: error|Link: error|Error occurred|failed with error|[Ee]xception|Fatal|FATAL)' | \
                     head -3 | while IFS= read -r line; do
                     log_status "DEBUG" "  $line"
@@ -1161,19 +1995,6 @@ EOF
         fi
 
         return 0
-    else
-        # Clear progress file on failure
-        echo '{"status": "failed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
-
-        # Check if the failure is due to API 5-hour limit
-        if grep -qi "5.*hour.*limit\|limit.*reached.*try.*back\|usage.*limit.*reached" "$output_file"; then
-            log_status "ERROR" "🚫 Claude API 5-hour usage limit reached"
-            return 2  # Special return code for API limit
-        else
-            log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
-            return 1
-        fi
-    fi
 }
 
 # CP-016.26: Global flag to track if signal handler already processed cleanup
@@ -1207,7 +2028,7 @@ cleanup_on_exit() {
 
     # CP-016.26: Don't overwrite interrupted/stopped/paused status
     # These were set intentionally by signal handlers or rate limit handling
-    if [[ "$current_status" == "stopped" || "$current_status" == "paused" || "$current_status" == "halted" ]]; then
+    if [[ "$current_status" == "stopped" || "$current_status" == "paused" || "$current_status" == "halted" || "$current_status" == "failed" ]]; then
         log_status "INFO" "Preserving existing status: $current_status"
         return
     fi
@@ -1225,6 +2046,9 @@ cleanup_on_exit() {
     elif [[ $exit_code -eq 3 ]]; then
         reason="circuit_breaker_trip"
         status="halted"
+    elif [[ $exit_code -eq 4 ]]; then
+        reason="review_only_no_mcp"
+        status="failed"
     fi
 
     log_status "INFO" "Ralph terminating (exit_code=$exit_code, reason=$reason)"
@@ -1272,6 +2096,7 @@ main() {
     log_status "SUCCESS" "🚀 Ralph loop starting with Claude Code"
     log_status "INFO" "Max calls per hour: $MAX_CALLS_PER_HOUR"
     log_status "INFO" "Logs: $LOG_DIR/ | Docs: $DOCS_DIR/ | Status: $STATUS_FILE"
+    local main_exit_code=0
     
     # Check if this is a Ralph project directory
     if [[ ! -f "$PROMPT_FILE" ]]; then
@@ -1318,7 +2143,7 @@ main() {
 
             if [[ "$AUTONOMOUS_MODE" == "true" ]]; then
                 log_status "INFO" "[AUTONOMOUS] Resuming rate limit wait: $remaining_minutes minutes remaining..."
-                loop_count=$saved_loop_count  # Restore loop count
+                loop_count=$(loop_count_pre_increment_for_resume "$saved_loop_count")  # Resume at saved loop number
 
                 # Continue countdown
                 while [[ $remaining_wait -gt 0 ]]; do
@@ -1346,7 +2171,7 @@ main() {
 
                 if [[ "$recovery_choice" == "1" ]]; then
                     log_status "INFO" "User chose to continue waiting..."
-                    loop_count=$saved_loop_count  # Restore loop count
+                    loop_count=$(loop_count_pre_increment_for_resume "$saved_loop_count")  # Resume at saved loop number
 
                     while [[ $remaining_wait -gt 0 ]]; do
                         local minutes=$((remaining_wait / 60))
@@ -1364,7 +2189,7 @@ main() {
             fi
         else
             log_status "INFO" "Rate limit wait period has passed, cleaning up recovery state..."
-            loop_count=$saved_loop_count  # Restore loop count
+            loop_count=$(loop_count_pre_increment_for_resume "$saved_loop_count")  # Resume at saved loop number
         fi
 
         # Clean up recovery state file
@@ -1420,9 +2245,13 @@ main() {
         local calls_made=$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")
         update_status "$loop_count" "$calls_made" "executing" "running"
         
-        # Execute Claude Code
-        execute_claude_code "$loop_count"
-        local exec_result=$?
+        # Execute Claude Code (guard against set -e on non-zero exit)
+        local exec_result=0
+        if execute_claude_code "$loop_count"; then
+            exec_result=0
+        else
+            exec_result=$?
+        fi
         
         if [ $exec_result -eq 0 ]; then
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "completed" "success"
@@ -1435,6 +2264,11 @@ main() {
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "circuit_breaker_open" "halted" "stagnation_detected"
             log_status "ERROR" "🛑 Circuit breaker has opened - halting loop"
             log_status "INFO" "Run 'ralph --reset-circuit' to reset the circuit breaker after addressing issues"
+            break
+        elif [ $exec_result -eq 4 ]; then
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "mcp_required" "failed" "review_only_no_mcp"
+            log_status "ERROR" "🛑 Review-only run failed: no Codex MCP usage detected"
+            main_exit_code=4
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
@@ -1478,6 +2312,10 @@ main() {
 
                 log_status "SUCCESS" "[AUTONOMOUS] Rate limit wait complete, resuming loop..."
                 update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "executing" "running" "resumed_after_rate_limit"
+
+                # Resume at the same loop number (do not advance numbering after a rate-limit pause)
+                loop_count=$(loop_count_pre_increment_for_resume "$loop_count")
+                continue
             else
                 # Interactive mode - ask user whether to wait or exit
                 echo -e "\n${YELLOW}The Claude API 5-hour usage limit has been reached.${NC}"
@@ -1510,6 +2348,10 @@ main() {
                         ((wait_seconds--))
                     done
                     printf "\n"
+
+                    # Resume at the same loop number after waiting
+                    loop_count=$(loop_count_pre_increment_for_resume "$loop_count")
+                    continue
                 fi
             fi
         else
@@ -1520,6 +2362,7 @@ main() {
         
         log_status "LOOP" "=== Completed Loop #$loop_count ==="
     done
+    return "$main_exit_code"
 }
 
 # Help function
@@ -1543,13 +2386,22 @@ Options:
     --reset-circuit         Reset circuit breaker to CLOSED state
     --circuit-status        Show circuit breaker status and exit
     --reset-session         Reset session state and exit (clears session continuity)
+    --reset-review-state    Reset review count state and exit
 
 Modern CLI Options (Phase 1.1):
     --output-format FORMAT  Set Claude output format: json or text (default: $CLAUDE_OUTPUT_FORMAT)
     --allowed-tools TOOLS   Comma-separated list of allowed tools (default: $CLAUDE_ALLOWED_TOOLS)
                             Supports scoped tokens: Read(<glob>), Write(<glob>), Edit(<glob>)
+    --permission-mode MODE  Set Claude CLI permission mode (default: unset)
+    --review-only           Restrict tools to Codex MCP only for this run
     --no-continue           Disable session continuity across loops
     --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
+
+Codex Context Options:
+    --codex-context FILE    Path to file list for Codex context bundle (optional)
+    --codex-context-max-lines N   Max lines per file in Codex context (default: $CODEX_CONTEXT_MAX_LINES)
+    --codex-context-max-chars N   Max chars per file in Codex context (default: $CODEX_CONTEXT_MAX_CHARS)
+    --codex-context-total-chars N Max total chars across bundle (default: $CODEX_CONTEXT_TOTAL_MAX_CHARS)
 
 Autonomous Mode Options (CP-016.26):
     --autonomous            Run without interactive prompts; auto-wait on rate limit and resume
@@ -1557,6 +2409,8 @@ Autonomous Mode Options (CP-016.26):
 Monorepo Options (Phase 6.5):
     --state-dir DIR         Directory for all state files (default: . - current directory)
     --fix-plan FILE         Path to fix plan file (default: $FIX_PLAN_FILE)
+    --focus-fix-plan        Append remaining fix plan items to the system prompt (default: on)
+    --no-focus-fix-plan     Disable fix plan focus injection
 
 Files created:
     - $LOG_DIR/: All execution logs
@@ -1580,6 +2434,7 @@ Examples:
     $0 --output-format text     # Use legacy text output format
     $0 --no-continue            # Disable session continuity
     $0 --session-expiry 48      # 48-hour session expiration
+    $0 --no-focus-fix-plan      # Disable fix plan focus injection
 
 HELPEOF
 }
@@ -1642,6 +2497,10 @@ while [[ $# -gt 0 ]]; do
             echo -e "\033[0;32m✅ Session state reset successfully\033[0m"
             exit 0
             ;;
+        --reset-review-state)
+            RESET_REVIEW_STATE=true
+            shift
+            ;;
         --circuit-status)
             # Source the circuit breaker library
             SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
@@ -1663,6 +2522,50 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             CLAUDE_ALLOWED_TOOLS="$2"
+            shift 2
+            ;;
+        --permission-mode)
+            if [[ -z "$2" ]]; then
+                echo "Error: --permission-mode requires a value"
+                exit 1
+            fi
+            CLAUDE_PERMISSION_MODE="$2"
+            shift 2
+            ;;
+        --review-only)
+            CODEX_REVIEW_ONLY=true
+            shift
+            ;;
+        --codex-context)
+            if [[ -z "$2" ]]; then
+                echo "Error: --codex-context requires a file path"
+                exit 1
+            fi
+            CODEX_CONTEXT_FILE="$2"
+            shift 2
+            ;;
+        --codex-context-max-lines)
+            if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --codex-context-max-lines requires a positive integer"
+                exit 1
+            fi
+            CODEX_CONTEXT_MAX_LINES="$2"
+            shift 2
+            ;;
+        --codex-context-max-chars)
+            if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --codex-context-max-chars requires a positive integer"
+                exit 1
+            fi
+            CODEX_CONTEXT_MAX_CHARS="$2"
+            shift 2
+            ;;
+        --codex-context-total-chars)
+            if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
+                echo "Error: --codex-context-total-chars requires a positive integer"
+                exit 1
+            fi
+            CODEX_CONTEXT_TOTAL_MAX_CHARS="$2"
             shift 2
             ;;
         --no-continue)
@@ -1693,6 +2596,14 @@ while [[ $# -gt 0 ]]; do
             FIX_PLAN_FILE="$2"
             shift 2
             ;;
+        --focus-fix-plan)
+            FOCUS_FIX_PLAN=true
+            shift
+            ;;
+        --no-focus-fix-plan)
+            FOCUS_FIX_PLAN=false
+            shift
+            ;;
         --autonomous)
             # CP-016.26: Enable autonomous mode - auto-wait on rate limit instead of prompting
             AUTONOMOUS_MODE=true
@@ -1708,6 +2619,12 @@ done
 
 # Setup state paths with STATE_DIR prefix
 setup_state_paths
+
+if [[ "$RESET_REVIEW_STATE" == "true" ]]; then
+    rm -f "$REVIEW_STATE_FILE"
+    echo -e "\033[0;32m✅ Review state reset successfully\033[0m"
+    exit 0
+fi
 
 # Only execute when run directly, not when sourced
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
