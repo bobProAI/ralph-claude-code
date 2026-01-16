@@ -36,6 +36,7 @@ CLAUDE_ALLOWED_TOOLS="Read,Write,Bash(git *),Bash(pnpm *)"  # Comma-separated li
 CLAUDE_USE_CONTINUE=true                 # Enable session continuity
 CLAUDE_SESSION_FILE_NAME=".claude_session_id" # Session ID persistence file (prefixed with STATE_DIR)
 CLAUDE_MIN_VERSION="2.0.76"              # Minimum required Claude CLI version
+CLAUDE_MCP_CONFIG=""                     # Path to .mcp.json for MCP server configuration
 
 # Session management configuration (Phase 1.2)
 # Note: SESSION_EXPIRATION_SECONDS is defined in lib/response_analyzer.sh (86400 = 24 hours)
@@ -847,6 +848,16 @@ build_claude_command() {
     # Add output format flag
     if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
         CLAUDE_CMD_ARGS+=("--output-format" "json")
+    fi
+
+    # Add MCP server configuration if specified
+    if [[ -n "$CLAUDE_MCP_CONFIG" ]]; then
+        if [[ -f "$CLAUDE_MCP_CONFIG" ]]; then
+            CLAUDE_CMD_ARGS+=("--mcp-config" "$CLAUDE_MCP_CONFIG")
+            log_status "INFO" "MCP config loaded: $CLAUDE_MCP_CONFIG"
+        else
+            log_status "WARN" "MCP config file not found: $CLAUDE_MCP_CONFIG"
+        fi
     fi
 
     # Add allowed tools (each tool as separate array element)
