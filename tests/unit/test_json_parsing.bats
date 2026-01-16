@@ -737,3 +737,157 @@ EOF
     # Should indicate no session to resume
     [[ "$status" -ne 0 || "$output" == "false" ]] || skip "should_resume_session not yet implemented"
 }
+
+# =============================================================================
+# CP-016.26: EXIT_SIGNAL EXTRACTION FROM EMBEDDED RALPH_STATUS
+# =============================================================================
+# Critical bug fix: Claude CLI embeds RALPH_STATUS in the .result field,
+# not as top-level JSON fields. These tests verify proper extraction.
+
+@test "parse_json_response extracts EXIT_SIGNAL from embedded RALPH_STATUS in result" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    # This is the actual format Claude CLI produces - RALPH_STATUS is inside .result
+    cat > "$output_file" << 'EOF'
+{
+    "result": "Implementation complete.\n\n---RALPH_STATUS---\nCP_NUMBER: CP-016.25\nSTATUS: COMPLETE\nTASKS_REMAINING: 0\nEXIT_SIGNAL: true\nRECOMMENDATION: All acceptance criteria verified\n---END_RALPH_STATUS---",
+    "sessionId": "session-abc123",
+    "total_cost_usd": 3.39
+}
+EOF
+
+    run parse_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    # Critical: exit_signal MUST be true when embedded RALPH_STATUS says EXIT_SIGNAL: true
+    local exit_signal=$(jq -r '.exit_signal' "$result_file")
+    assert_equal "$exit_signal" "true"
+}
+
+@test "parse_json_response extracts EXIT_SIGNAL: false from embedded RALPH_STATUS" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    cat > "$output_file" << 'EOF'
+{
+    "result": "Working on tasks.\n\n---RALPH_STATUS---\nCP_NUMBER: CP-016.25\nSTATUS: IN_PROGRESS\nTASKS_REMAINING: 5\nEXIT_SIGNAL: false\nRECOMMENDATION: Continue implementing AC-3\n---END_RALPH_STATUS---",
+    "sessionId": "session-def456"
+}
+EOF
+
+    run parse_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    local exit_signal=$(jq -r '.exit_signal' "$result_file")
+    assert_equal "$exit_signal" "false"
+}
+
+@test "parse_json_response handles newlines in RALPH_STATUS block correctly" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    # Test with actual newlines (not escaped \n)
+    cat > "$output_file" << 'JSONEOF'
+{
+    "result": "All done.\n\n---RALPH_STATUS---\nSTATUS: COMPLETE\nEXIT_SIGNAL: true\n---END_RALPH_STATUS---",
+    "sessionId": "test-session"
+}
+JSONEOF
+
+    run parse_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    local exit_signal=$(jq -r '.exit_signal' "$result_file")
+    assert_equal "$exit_signal" "true"
+}
+
+@test "parse_json_response handles REVIEW_LOOP status with EXIT_SIGNAL false" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    cat > "$output_file" << 'EOF'
+{
+    "result": "In Codex review.\n\n---RALPH_STATUS---\nCP_NUMBER: CP-016.26\nSTATUS: REVIEW_LOOP\nREVIEW_COUNT: 1\nREVIEW_VERDICT: NEEDS_FIXES\nEXIT_SIGNAL: false\n---END_RALPH_STATUS---",
+    "sessionId": "review-session"
+}
+EOF
+
+    run parse_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    # REVIEW_LOOP with NEEDS_FIXES should NOT exit
+    local exit_signal=$(jq -r '.exit_signal' "$result_file")
+    assert_equal "$exit_signal" "false"
+}
+
+@test "parse_json_response does not extract EXIT_SIGNAL from non-RALPH_STATUS content" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    # EXIT_SIGNAL text outside RALPH_STATUS block should NOT trigger exit
+    cat > "$output_file" << 'EOF'
+{
+    "result": "I mentioned EXIT_SIGNAL: true in my explanation but the actual status is still in progress.\n\n---RALPH_STATUS---\nSTATUS: IN_PROGRESS\nEXIT_SIGNAL: false\n---END_RALPH_STATUS---",
+    "sessionId": "no-false-positive"
+}
+EOF
+
+    run parse_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    # Should use the EXIT_SIGNAL from inside the block (false), not the text mention
+    local exit_signal=$(jq -r '.exit_signal' "$result_file")
+    assert_equal "$exit_signal" "false"
+}
+
+# =============================================================================
+# CP-016.26: MCP CALL TRACKING TESTS
+# =============================================================================
+
+@test "parse_json_response tracks mcp_calls from result text" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    cat > "$output_file" << 'EOF'
+{
+    "result": "I delegated the implementation to Codex using mcp__codex__codex tool. The result was excellent.",
+    "sessionId": "mcp-test"
+}
+EOF
+
+    run parse_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    local mcp_calls=$(jq -r '.mcp_calls' "$result_file")
+    [[ "$mcp_calls" -ge 1 ]] || fail "Expected at least 1 MCP call, got $mcp_calls"
+}
+
+@test "parse_json_response tracks mcp_calls from usage metadata" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    cat > "$output_file" << 'EOF'
+{
+    "result": "Task completed.",
+    "sessionId": "mcp-usage-test",
+    "modelUsage": {
+        "codex_requests": 3
+    }
+}
+EOF
+
+    run parse_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_json_response did not create result file"
+
+    # Should detect codex in usage keys
+    local mcp_calls=$(jq -r '.mcp_calls' "$result_file")
+    [[ "$mcp_calls" -ge 1 ]] || fail "Expected at least 1 MCP call from usage metadata, got $mcp_calls"
+}

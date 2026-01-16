@@ -106,6 +106,22 @@ parse_json_response() {
     # Summary: from flat format OR from result field (Claude CLI format)
     local summary=$(jq -r '.result // .summary // ""' "$output_file" 2>/dev/null)
 
+    # CP-016.26: Extract EXIT_SIGNAL from embedded RALPH_STATUS block in .result
+    # Claude CLI embeds the RALPH_STATUS in the result text, not as a top-level JSON field
+    # Bug: Previous code looked at .exit_signal which is always null/false for Claude CLI format
+    if [[ "$summary" == *"---RALPH_STATUS---"* ]]; then
+        local embedded_exit
+        # Use portable grep -Eo with awk (no grep -P which is GNU-only)
+        embedded_exit=$(echo "$summary" | grep -Eo 'EXIT_SIGNAL:[[:space:]]*(true|false)' | tail -1 | awk -F':' '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2}' || true)
+        if [[ "$embedded_exit" == "true" ]]; then
+            exit_signal="true"
+            [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Extracted EXIT_SIGNAL=true from embedded RALPH_STATUS block" >&2
+        elif [[ "$embedded_exit" == "false" ]]; then
+            exit_signal="false"
+            [[ "${VERBOSE_PROGRESS:-}" == "true" ]] && echo "DEBUG: Extracted EXIT_SIGNAL=false from embedded RALPH_STATUS block" >&2
+        fi
+    fi
+
     # Session ID: from Claude CLI format (sessionId) OR from metadata.session_id
     local session_id=$(jq -r '.sessionId // .metadata.session_id // ""' "$output_file" 2>/dev/null)
 
@@ -117,6 +133,18 @@ parse_json_response() {
 
     # Progress indicators: from Claude CLI metadata (optional)
     local progress_count=$(jq -r '.metadata.progress_indicators | if . then length else 0 end' "$output_file" 2>/dev/null)
+
+    # CP-016.26: Track MCP tool usage when JSON output includes usage metadata
+    # This helps verify Codex delegation is working
+    local mcp_calls=0
+    if jq -e '.modelUsage // .usage // .tool_usage' "$output_file" >/dev/null 2>&1; then
+        # Count Codex MCP tool calls from usage metadata
+        mcp_calls=$(jq -r '(.modelUsage // .usage // .tool_usage // {}) | keys[]' "$output_file" 2>/dev/null | grep -c "codex" || echo "0")
+    fi
+    # Also check for mcp__ patterns in the result text (tool call evidence)
+    if [[ "$summary" == *"mcp__codex__"* ]]; then
+        mcp_calls=$((mcp_calls + $(echo "$summary" | grep -oE 'mcp__codex__[a-z_]+' | wc -l)))
+    fi
 
     # Normalize values
     # Convert exit_signal to boolean string
@@ -173,6 +201,7 @@ parse_json_response() {
         --argjson loop_number "$loop_number" \
         --arg session_id "$session_id" \
         --argjson confidence "$confidence" \
+        --argjson mcp_calls "$mcp_calls" \
         '{
             status: $status,
             exit_signal: $exit_signal,
@@ -185,9 +214,11 @@ parse_json_response() {
             loop_number: $loop_number,
             session_id: $session_id,
             confidence: $confidence,
+            mcp_calls: $mcp_calls,
             metadata: {
                 loop_number: $loop_number,
-                session_id: $session_id
+                session_id: $session_id,
+                mcp_calls: $mcp_calls
             }
         }' > "$result_file"
 

@@ -15,6 +15,7 @@ source "$SCRIPT_DIR/lib/circuit_breaker.sh"
 STATE_DIR="."  # Default: current directory (preserves existing behavior)
 PROMPT_FILE="PROMPT.md"
 FIX_PLAN_FILE="@fix_plan.md"  # Default fix plan location
+AUTONOMOUS_MODE=false  # CP-016.26: When true, auto-wait on rate limit instead of prompting
 # Note: These paths are relative to STATE_DIR - they will be prefixed after arg parsing
 LOG_DIR_NAME="logs"
 DOCS_DIR_NAME="docs/generated"
@@ -309,57 +310,62 @@ wait_for_reset() {
 # Check if we should gracefully exit
 should_exit_gracefully() {
     log_status "INFO" "DEBUG: Checking exit conditions..." >&2
-    
+
+    # CP-016.26: PRIORITY 1 - Check Claude's explicit EXIT_SIGNAL first
+    # This is the authoritative signal from Claude's RALPH_STATUS block.
+    # If Claude says EXIT_SIGNAL: true, we exit immediately - no heuristics needed.
+    local claude_exit_signal="false"
+    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
+        # Check both .analysis.exit_signal and .exit_signal (different formats)
+        claude_exit_signal=$(jq -r '.analysis.exit_signal // .exit_signal // "false"' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "false")
+    fi
+
+    if [[ "$claude_exit_signal" == "true" ]]; then
+        log_status "SUCCESS" "Exit condition: Claude explicit EXIT_SIGNAL=true in RALPH_STATUS block"
+        echo "exit_signal"
+        return 0
+    fi
+
     if [[ ! -f "$EXIT_SIGNALS_FILE" ]]; then
         log_status "INFO" "DEBUG: No exit signals file found, continuing..." >&2
         return 1  # Don't exit, file doesn't exist
     fi
-    
+
     local signals=$(cat "$EXIT_SIGNALS_FILE")
     log_status "INFO" "DEBUG: Exit signals content: $signals" >&2
-    
+
     # Count recent signals (last 5 loops) - with error handling
     local recent_test_loops
-    local recent_done_signals  
+    local recent_done_signals
     local recent_completion_indicators
-    
+
     recent_test_loops=$(echo "$signals" | jq '.test_only_loops | length' 2>/dev/null || echo "0")
     recent_done_signals=$(echo "$signals" | jq '.done_signals | length' 2>/dev/null || echo "0")
     recent_completion_indicators=$(echo "$signals" | jq '.completion_indicators | length' 2>/dev/null || echo "0")
-    
+
     log_status "INFO" "DEBUG: Exit counts - test_loops:$recent_test_loops, done_signals:$recent_done_signals, completion:$recent_completion_indicators" >&2
-    
-    # Check for exit conditions
-    
-    # 1. Too many consecutive test-only loops
+
+    # Check for exit conditions (heuristics - only if EXIT_SIGNAL not explicit)
+
+    # 2. Too many consecutive test-only loops
     if [[ $recent_test_loops -ge $MAX_CONSECUTIVE_TEST_LOOPS ]]; then
         log_status "WARN" "Exit condition: Too many test-focused loops ($recent_test_loops >= $MAX_CONSECUTIVE_TEST_LOOPS)"
         echo "test_saturation"
         return 0
     fi
-    
-    # 2. Multiple "done" signals
+
+    # 3. Multiple "done" signals
     if [[ $recent_done_signals -ge $MAX_CONSECUTIVE_DONE_SIGNALS ]]; then
         log_status "WARN" "Exit condition: Multiple completion signals ($recent_done_signals >= $MAX_CONSECUTIVE_DONE_SIGNALS)"
         echo "completion_signals"
         return 0
     fi
-    
-    # 3. Strong completion indicators (only if Claude's EXIT_SIGNAL is true)
-    # This prevents premature exits when heuristics detect completion patterns
-    # but Claude explicitly indicates work is still in progress via RALPH_STATUS block.
-    # The exit_signal in $RESPONSE_ANALYSIS_FILE represents Claude's explicit intent.
-    local claude_exit_signal="false"
-    if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
-        claude_exit_signal=$(jq -r '.analysis.exit_signal // false' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "false")
-    fi
 
-    if [[ $recent_completion_indicators -ge 2 ]] && [[ "$claude_exit_signal" == "true" ]]; then
-        log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators) with EXIT_SIGNAL=true" >&2
+    # 4. Strong completion indicators (backup heuristic)
+    if [[ $recent_completion_indicators -ge 3 ]]; then
+        log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators >= 3)" >&2
         echo "project_complete"
         return 0
-    elif [[ $recent_completion_indicators -ge 2 ]]; then
-        log_status "INFO" "DEBUG: Completion indicators ($recent_completion_indicators) present but EXIT_SIGNAL=false, continuing..." >&2
     fi
     
     # 4. Check fix_plan.md for completion
@@ -632,6 +638,73 @@ save_claude_session() {
             echo "$session_id" > "$CLAUDE_SESSION_FILE"
             log_status "INFO" "Saved Claude session: ${session_id:0:20}..."
         fi
+    fi
+}
+
+# =============================================================================
+# CP-016.26: AUTONOMOUS MODE HELPER FUNCTIONS
+# =============================================================================
+
+# Calculate wait time from rate limit error message
+# Error format: "You've hit your limit · resets 11pm (America/New_York)"
+# Also supports: "resets 11:30pm (America/New_York)" with optional minutes
+# Returns: wait time in seconds (includes 5-minute buffer)
+calculate_wait_time() {
+    local error_msg="$1"
+    local reset_time reset_tz current_epoch reset_epoch wait_seconds os_type
+
+    # Extract reset time and timezone using extended regex
+    # Supports: "resets 11pm", "resets 11:30pm", "resets 11:30 pm"
+    if [[ "$error_msg" =~ resets[[:space:]]([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*(am|pm)[[:space:]]*\(([^)]+)\) ]]; then
+        local hour="${BASH_REMATCH[1]}"
+        local minute="${BASH_REMATCH[3]:-00}"
+        local ampm="${BASH_REMATCH[4]}"
+        local tz="${BASH_REMATCH[5]}"
+
+        # Convert to 24-hour format
+        if [[ "$ampm" == "pm" && "$hour" != "12" ]]; then
+            hour=$((hour + 12))
+        elif [[ "$ampm" == "am" && "$hour" == "12" ]]; then
+            hour=0
+        fi
+
+        # Get current time in the specified timezone
+        current_epoch=$(TZ="$tz" date +%s 2>/dev/null)
+
+        # Calculate reset epoch (today at reset hour, or tomorrow if past)
+        # Use GNU/BSD-compatible date handling
+        os_type=$(uname)
+        if [[ "$os_type" == "Darwin" ]]; then
+            # macOS (BSD date)
+            reset_epoch=$(TZ="$tz" date -j -f "%H:%M" "$hour:$minute" +%s 2>/dev/null)
+        else
+            # Linux (GNU date)
+            reset_epoch=$(TZ="$tz" date -d "today $hour:$minute" +%s 2>/dev/null)
+        fi
+
+        # If reset time calculation failed, use fallback
+        if [[ -z "$reset_epoch" ]]; then
+            log_status "WARN" "Failed to calculate reset time, using 60-minute fallback"
+            echo "3600"
+            return
+        fi
+
+        # If reset time is in the past, add 24 hours
+        if [[ $reset_epoch -le $current_epoch ]]; then
+            reset_epoch=$((reset_epoch + 86400))
+        fi
+
+        wait_seconds=$((reset_epoch - current_epoch))
+
+        # Add 5-minute buffer for safety
+        wait_seconds=$((wait_seconds + 300))
+
+        log_status "INFO" "Calculated wait time: $((wait_seconds / 60)) minutes until reset"
+        echo "$wait_seconds"
+    else
+        # Fallback to 60 minutes if parsing fails
+        log_status "WARN" "Could not parse reset time from error message, using 60-minute fallback"
+        echo "3600"
     fi
 }
 
@@ -1010,6 +1083,21 @@ EOF
     wait $claude_pid
     local exit_code=$?
 
+    # CP-016.26: Check for errors embedded in JSON response even with exit code 0
+    # Rate limit errors can come as {"is_error": true, "result": "You've hit your limit..."}
+    if [ $exit_code -eq 0 ] && jq -e '.is_error == true' "$output_file" >/dev/null 2>&1; then
+        local error_msg=$(jq -r '.result // "Unknown error"' "$output_file" 2>/dev/null)
+        if [[ "$error_msg" == *"limit"* ]] || [[ "$error_msg" == *"resets"* ]]; then
+            log_status "ERROR" "API rate limit detected in JSON response: $error_msg"
+            # Store error message for wait time calculation
+            echo "$error_msg" > "$STATE_DIR/.rate_limit_error"
+            exit_code=2  # Treat as rate limit error
+        else
+            log_status "ERROR" "Claude returned error: $error_msg"
+            exit_code=1
+        fi
+    fi
+
     if [ $exit_code -eq 0 ]; then
         # Only increment counter on successful execution
         echo "$calls_made" > "$CALL_COUNT_FILE"
@@ -1086,15 +1174,91 @@ EOF
     fi
 }
 
-# Cleanup function
+# CP-016.26: Global flag to track if signal handler already processed cleanup
+# This prevents EXIT trap from overwriting status set by SIGINT/SIGTERM handlers
+SIGNAL_CLEANUP_DONE=false
+
+# CP-016.26: Enhanced cleanup function with graceful exit preservation
+# Handles EXIT signal - runs after other handlers exit
+cleanup_on_exit() {
+    local exit_code=$?
+
+    # CP-016.26: If SIGINT/SIGTERM handler already ran, don't overwrite status
+    if [[ "$SIGNAL_CLEANUP_DONE" == "true" ]]; then
+        log_status "INFO" "Cleanup already done by signal handler, skipping EXIT trap"
+        return
+    fi
+
+    # Check if we already have a graceful exit - don't overwrite
+    local last_action=""
+    local current_status=""
+    if [[ -f "$STATUS_FILE" ]]; then
+        last_action=$(jq -r '.last_action // ""' "$STATUS_FILE" 2>/dev/null || echo "")
+        current_status=$(jq -r '.status // ""' "$STATUS_FILE" 2>/dev/null || echo "")
+    fi
+
+    # Don't overwrite graceful_exit status (project completed successfully)
+    if [[ "$last_action" == "graceful_exit" ]]; then
+        log_status "INFO" "Preserving graceful_exit status"
+        return
+    fi
+
+    # CP-016.26: Don't overwrite interrupted/stopped/paused status
+    # These were set intentionally by signal handlers or rate limit handling
+    if [[ "$current_status" == "stopped" || "$current_status" == "paused" || "$current_status" == "halted" ]]; then
+        log_status "INFO" "Preserving existing status: $current_status"
+        return
+    fi
+
+    # Determine reason based on exit code and context
+    local reason="interrupted"
+    local status="stopped"
+
+    if [[ $exit_code -eq 2 ]]; then
+        reason="api_5hour_limit"
+        status="paused"
+    elif [[ $exit_code -eq 0 ]]; then
+        reason="completed"
+        status="completed"
+    elif [[ $exit_code -eq 3 ]]; then
+        reason="circuit_breaker_trip"
+        status="halted"
+    fi
+
+    log_status "INFO" "Ralph terminating (exit_code=$exit_code, reason=$reason)"
+    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo 0)" \
+        "interrupted" "$status" "$reason"
+
+    # Reset session for non-graceful terminations
+    if [[ "$reason" != "completed" ]]; then
+        reset_session "manual_interrupt"
+    fi
+}
+
+# SIGINT/SIGTERM handler - sets status before exit triggers EXIT trap
 cleanup() {
-    log_status "INFO" "Ralph loop interrupted. Cleaning up..."
-    reset_session "manual_interrupt"
-    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped"
+    log_status "INFO" "Ralph loop interrupted by signal. Cleaning up..."
+
+    # Mark that signal handler is doing cleanup
+    SIGNAL_CLEANUP_DONE=true
+
+    # Check if we already have a graceful exit
+    local last_action=""
+    if [[ -f "$STATUS_FILE" ]]; then
+        last_action=$(jq -r '.last_action // ""' "$STATUS_FILE" 2>/dev/null || echo "")
+    fi
+
+    if [[ "$last_action" != "graceful_exit" ]]; then
+        reset_session "manual_interrupt"
+        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped" "signal_interrupt"
+    fi
     exit 0
 }
 
 # Set up signal handlers
+# EXIT trap uses cleanup_on_exit for comprehensive handling
+# SIGINT/SIGTERM use cleanup for immediate response
+trap cleanup_on_exit EXIT
 trap cleanup SIGINT SIGTERM
 
 # Global variable for loop count (needed by cleanup function)
@@ -1133,6 +1297,78 @@ main() {
 
     # Initialize session tracking before entering the loop
     init_session_tracking
+
+    # CP-016.26: Check for rate_limit_loop recovery state
+    if [[ -f "$STATE_DIR/.rate_limit_loop" ]]; then
+        log_status "INFO" "Detected rate limit recovery state file..."
+        local rate_limit_state
+        rate_limit_state=$(cat "$STATE_DIR/.rate_limit_loop" 2>/dev/null || echo "{}")
+        local wait_until
+        wait_until=$(echo "$rate_limit_state" | jq -r '.wait_until // 0' 2>/dev/null || echo "0")
+        local saved_loop_count
+        saved_loop_count=$(echo "$rate_limit_state" | jq -r '.loop_count // 0' 2>/dev/null || echo "0")
+        local current_time
+        current_time=$(date +%s)
+
+        if [[ "$wait_until" -gt "$current_time" ]]; then
+            local remaining_wait=$((wait_until - current_time))
+            local remaining_minutes=$((remaining_wait / 60))
+
+            if [[ "$AUTONOMOUS_MODE" == "true" ]]; then
+                log_status "INFO" "[AUTONOMOUS] Resuming rate limit wait: $remaining_minutes minutes remaining..."
+                loop_count=$saved_loop_count  # Restore loop count
+
+                # Continue countdown
+                while [[ $remaining_wait -gt 0 ]]; do
+                    local hours=$((remaining_wait / 3600))
+                    local minutes=$(((remaining_wait % 3600) / 60))
+                    local seconds=$((remaining_wait % 60))
+                    printf "\r${YELLOW}[AUTONOMOUS] Time until retry: %02d:%02d:%02d${NC}" $hours $minutes $seconds
+                    sleep 1
+                    ((remaining_wait--))
+                done
+                printf "\n"
+
+                log_status "SUCCESS" "[AUTONOMOUS] Rate limit wait complete (recovered), starting loop..."
+            else
+                # Interactive mode - ask user
+                echo -e "\n${YELLOW}Ralph was previously waiting for rate limit reset.${NC}"
+                echo -e "Wait time remaining: $remaining_minutes minutes"
+                echo -e "\n${BLUE}Do you want to:${NC}"
+                echo -e "  ${GREEN}1)${NC} Continue waiting"
+                echo -e "  ${GREEN}2)${NC} Start fresh (skip wait)"
+                echo -e "\n${BLUE}Choose an option (1 or 2):${NC} "
+
+                read -t 30 -n 1 recovery_choice
+                echo
+
+                if [[ "$recovery_choice" == "1" ]]; then
+                    log_status "INFO" "User chose to continue waiting..."
+                    loop_count=$saved_loop_count  # Restore loop count
+
+                    while [[ $remaining_wait -gt 0 ]]; do
+                        local minutes=$((remaining_wait / 60))
+                        local seconds=$((remaining_wait % 60))
+                        printf "\r${YELLOW}Time until retry: %02d:%02d${NC}" $minutes $seconds
+                        sleep 1
+                        ((remaining_wait--))
+                    done
+                    printf "\n"
+
+                    log_status "SUCCESS" "Rate limit wait complete (recovered), starting loop..."
+                else
+                    log_status "INFO" "User chose to start fresh, skipping remaining wait..."
+                fi
+            fi
+        else
+            log_status "INFO" "Rate limit wait period has passed, cleaning up recovery state..."
+            loop_count=$saved_loop_count  # Restore loop count
+        fi
+
+        # Clean up recovery state file
+        rm -f "$STATE_DIR/.rate_limit_loop"
+        rm -f "$STATE_DIR/.rate_limit_error"
+    fi
 
     log_status "INFO" "Starting main loop..."
     log_status "INFO" "DEBUG: About to enter while loop, loop_count=$loop_count"
@@ -1200,40 +1436,79 @@ main() {
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused"
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused" "rate_limited"
             log_status "WARN" "🛑 Claude API 5-hour limit reached!"
-            
-            # Ask user whether to wait or exit
-            echo -e "\n${YELLOW}The Claude API 5-hour usage limit has been reached.${NC}"
-            echo -e "${YELLOW}You can either:${NC}"
-            echo -e "  ${GREEN}1)${NC} Wait for the limit to reset (usually within an hour)"
-            echo -e "  ${GREEN}2)${NC} Exit the loop and try again later"
-            echo -e "\n${BLUE}Choose an option (1 or 2):${NC} "
-            
-            # Read user input with timeout
-            read -t 30 -n 1 user_choice
-            echo  # New line after input
-            
-            if [[ "$user_choice" == "2" ]] || [[ -z "$user_choice" ]]; then
-                log_status "INFO" "User chose to exit (or timed out). Exiting loop..."
-                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit"
-                break
-            else
-                log_status "INFO" "User chose to wait. Waiting for API limit reset..."
-                # Wait for longer period when API limit is hit
-                local wait_minutes=60
-                log_status "INFO" "Waiting $wait_minutes minutes before retrying..."
-                
-                # Countdown display
-                local wait_seconds=$((wait_minutes * 60))
+
+            # CP-016.26: Autonomous mode - auto-wait without user interaction
+            if [[ "$AUTONOMOUS_MODE" == "true" ]]; then
+                log_status "INFO" "[AUTONOMOUS] Auto-wait enabled - calculating optimal wait time..."
+
+                # Read error message from state file if available
+                local error_msg=""
+                if [[ -f "$STATE_DIR/.rate_limit_error" ]]; then
+                    error_msg=$(cat "$STATE_DIR/.rate_limit_error" 2>/dev/null || echo "")
+                fi
+
+                # Calculate wait time from error message
+                local wait_seconds
+                wait_seconds=$(calculate_wait_time "$error_msg")
+                local wait_minutes=$((wait_seconds / 60))
+
+                log_status "INFO" "[AUTONOMOUS] Waiting $wait_minutes minutes ($wait_seconds seconds) until rate limit reset..."
+
+                # Save state for potential crash recovery
+                echo "{\"mode\":\"rate_limit_wait\",\"wait_until\":$(($(date +%s) + wait_seconds)),\"loop_count\":$loop_count}" > "$STATE_DIR/.rate_limit_loop"
+
+                # Countdown display (no user interaction)
                 while [[ $wait_seconds -gt 0 ]]; do
-                    local minutes=$((wait_seconds / 60))
+                    local hours=$((wait_seconds / 3600))
+                    local minutes=$(((wait_seconds % 3600) / 60))
                     local seconds=$((wait_seconds % 60))
-                    printf "\r${YELLOW}Time until retry: %02d:%02d${NC}" $minutes $seconds
+                    printf "\r${YELLOW}[AUTONOMOUS] Time until retry: %02d:%02d:%02d${NC}" $hours $minutes $seconds
                     sleep 1
                     ((wait_seconds--))
                 done
                 printf "\n"
+
+                # Clean up state file
+                rm -f "$STATE_DIR/.rate_limit_loop"
+                rm -f "$STATE_DIR/.rate_limit_error"
+
+                log_status "SUCCESS" "[AUTONOMOUS] Rate limit wait complete, resuming loop..."
+                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "executing" "running" "resumed_after_rate_limit"
+            else
+                # Interactive mode - ask user whether to wait or exit
+                echo -e "\n${YELLOW}The Claude API 5-hour usage limit has been reached.${NC}"
+                echo -e "${YELLOW}You can either:${NC}"
+                echo -e "  ${GREEN}1)${NC} Wait for the limit to reset (usually within an hour)"
+                echo -e "  ${GREEN}2)${NC} Exit the loop and try again later"
+                echo -e "\n${BLUE}Choose an option (1 or 2):${NC} "
+
+                # Read user input with timeout
+                read -t 30 -n 1 user_choice
+                echo  # New line after input
+
+                if [[ "$user_choice" == "2" ]] || [[ -z "$user_choice" ]]; then
+                    log_status "INFO" "User chose to exit (or timed out). Exiting loop..."
+                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit"
+                    break
+                else
+                    log_status "INFO" "User chose to wait. Waiting for API limit reset..."
+                    # Wait for longer period when API limit is hit
+                    local wait_minutes=60
+                    log_status "INFO" "Waiting $wait_minutes minutes before retrying..."
+
+                    # Countdown display
+                    local wait_seconds=$((wait_minutes * 60))
+                    while [[ $wait_seconds -gt 0 ]]; do
+                        local minutes=$((wait_seconds / 60))
+                        local seconds=$((wait_seconds % 60))
+                        printf "\r${YELLOW}Time until retry: %02d:%02d${NC}" $minutes $seconds
+                        sleep 1
+                        ((wait_seconds--))
+                    done
+                    printf "\n"
+                fi
             fi
         else
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
@@ -1273,6 +1548,9 @@ Modern CLI Options (Phase 1.1):
                             Supports scoped tokens: Read(<glob>), Write(<glob>), Edit(<glob>)
     --no-continue           Disable session continuity across loops
     --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
+
+Autonomous Mode Options (CP-016.26):
+    --autonomous            Run without interactive prompts; auto-wait on rate limit and resume
 
 Monorepo Options (Phase 6.5):
     --state-dir DIR         Directory for all state files (default: . - current directory)
@@ -1412,6 +1690,11 @@ while [[ $# -gt 0 ]]; do
             fi
             FIX_PLAN_FILE="$2"
             shift 2
+            ;;
+        --autonomous)
+            # CP-016.26: Enable autonomous mode - auto-wait on rate limit instead of prompting
+            AUTONOMOUS_MODE=true
+            shift
             ;;
         *)
             echo "Unknown option: $1"
