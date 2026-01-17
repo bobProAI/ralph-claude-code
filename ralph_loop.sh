@@ -13,6 +13,7 @@ source "$SCRIPT_DIR/lib/circuit_breaker.sh"
 
 # Configuration
 STATE_DIR="."  # Default: current directory (preserves existing behavior)
+STATE_PATHS_READY=false
 PROMPT_FILE="PROMPT.md"
 FIX_PLAN_FILE="@fix_plan.md"  # Default fix plan location
 AUTONOMOUS_MODE=false  # CP-016.26: When true, auto-wait on rate limit instead of prompting
@@ -132,6 +133,7 @@ setup_state_paths() {
 
     # Initialize directories under STATE_DIR
     mkdir -p "$LOG_DIR" "$DOCS_DIR"
+    STATE_PATHS_READY=true
 }
 
 # Check if tmux is available
@@ -1770,7 +1772,7 @@ execute_claude_code() {
                 if [[ -n "$extra_prompt" ]]; then
                     CLAUDE_CMD_ARGS+=("--append-system-prompt" "$extra_prompt")
                 fi
-                log_status "INFO" "Using modern CLI mode (JSON output)"
+                log_status "INFO" "Using modern CLI mode"
             else
                 log_status "WARN" "Failed to build modern CLI command, falling back to legacy mode"
             fi
@@ -2006,6 +2008,11 @@ SIGNAL_CLEANUP_DONE=false
 cleanup_on_exit() {
     local exit_code=$?
 
+    # Only manage status/session when running the main loop (paths initialized).
+    if [[ "$STATE_PATHS_READY" != "true" ]]; then
+        return
+    fi
+
     # CP-016.26: If SIGINT/SIGTERM handler already ran, don't overwrite status
     if [[ "$SIGNAL_CLEANUP_DONE" == "true" ]]; then
         log_status "INFO" "Cleanup already done by signal handler, skipping EXIT trap"
@@ -2063,6 +2070,10 @@ cleanup_on_exit() {
 
 # SIGINT/SIGTERM handler - sets status before exit triggers EXIT trap
 cleanup() {
+    if [[ "$STATE_PATHS_READY" != "true" ]]; then
+        exit 0
+    fi
+
     log_status "INFO" "Ralph loop interrupted by signal. Cleaning up..."
 
     # Mark that signal handler is doing cleanup
@@ -2440,8 +2451,8 @@ HELPEOF
 }
 
 # Parse command line arguments
-while [[ $# -gt 0 ]]; do
-    case $1 in
+	while [[ $# -gt 0 ]]; do
+	    case $1 in
         -h|--help)
             show_help
             exit 0
@@ -2454,12 +2465,13 @@ while [[ $# -gt 0 ]]; do
             PROMPT_FILE="$2"
             shift 2
             ;;
-        -s|--status)
-            if [[ -f "$STATUS_FILE" ]]; then
-                echo "Current Status:"
-                cat "$STATUS_FILE" | jq . 2>/dev/null || cat "$STATUS_FILE"
-            else
-                echo "No status file found. Ralph may not be running."
+	        -s|--status)
+	            setup_state_paths
+	            if [[ -f "$STATUS_FILE" ]]; then
+	                echo "Current Status:"
+	                cat "$STATUS_FILE" | jq . 2>/dev/null || cat "$STATUS_FILE"
+	            else
+	                echo "No status file found. Ralph may not be running."
             fi
             exit 0
             ;;
@@ -2480,34 +2492,37 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
-        --reset-circuit)
-            # Source the circuit breaker library
-            SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
-            source "$SCRIPT_DIR/lib/circuit_breaker.sh"
-            source "$SCRIPT_DIR/lib/date_utils.sh"
-            reset_circuit_breaker "Manual reset via command line"
-            reset_session "manual_circuit_reset"
-            exit 0
-            ;;
-        --reset-session)
-            # Reset session state only
-            SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
-            source "$SCRIPT_DIR/lib/date_utils.sh"
-            reset_session "manual_reset_flag"
-            echo -e "\033[0;32m✅ Session state reset successfully\033[0m"
-            exit 0
-            ;;
+	        --reset-circuit)
+	            # Source the circuit breaker library
+	            SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+	            source "$SCRIPT_DIR/lib/circuit_breaker.sh"
+	            source "$SCRIPT_DIR/lib/date_utils.sh"
+	            setup_state_paths
+	            reset_circuit_breaker "Manual reset via command line"
+	            reset_session "manual_circuit_reset"
+	            exit 0
+	            ;;
+	        --reset-session)
+	            # Reset session state only
+	            SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+	            source "$SCRIPT_DIR/lib/date_utils.sh"
+	            setup_state_paths
+	            reset_session "manual_reset_flag"
+	            echo -e "\033[0;32m✅ Session state reset successfully\033[0m"
+	            exit 0
+	            ;;
         --reset-review-state)
             RESET_REVIEW_STATE=true
             shift
             ;;
-        --circuit-status)
-            # Source the circuit breaker library
-            SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
-            source "$SCRIPT_DIR/lib/circuit_breaker.sh"
-            show_circuit_status
-            exit 0
-            ;;
+	        --circuit-status)
+	            # Source the circuit breaker library
+	            SCRIPT_DIR="$(dirname "${BASH_SOURCE[0]}")"
+	            source "$SCRIPT_DIR/lib/circuit_breaker.sh"
+	            setup_state_paths
+	            show_circuit_status
+	            exit 0
+	            ;;
         --output-format)
             if [[ "$2" == "json" || "$2" == "text" ]]; then
                 CLAUDE_OUTPUT_FORMAT="$2"

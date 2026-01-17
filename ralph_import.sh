@@ -273,9 +273,11 @@ check_dependencies() {
         log "ERROR" "Ralph not installed. Run ./install.sh first"
         exit 1
     fi
-    
-    if ! npx @anthropic/claude-code --version &> /dev/null 2>&1; then
-        log "WARN" "Claude Code CLI not found. It will be downloaded when first used."
+
+    # Avoid network-dependent checks here. If Claude Code isn't installed, the
+    # conversion step will fail with a clear error.
+    if ! command -v "$CLAUDE_CODE_CMD" &> /dev/null; then
+        log "WARN" "Claude Code CLI not found in PATH (expected: $CLAUDE_CODE_CMD). Install it before using ralph-import."
     fi
 }
 

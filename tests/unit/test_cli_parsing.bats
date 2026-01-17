@@ -249,7 +249,7 @@ EOF
 }
 
 @test "--allowed-tools flag accepts valid tool list" {
-    run bash "$RALPH_SCRIPT" --allowed-tools "Write,Read,Bash" --help
+    run bash "$RALPH_SCRIPT" --allowed-tools "Write,Read,Bash(git *),Bash(pnpm *)" --help
 
     assert_success
     [[ "$output" == *"Usage:"* ]]

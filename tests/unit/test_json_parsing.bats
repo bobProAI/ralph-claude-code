@@ -73,6 +73,49 @@ EOF
     assert_equal "$output" "stream-json"
 }
 
+@test "parse_stream_json_response counts unique Codex MCP tool calls in stream-json output" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    # Real Claude stream-json tool usage is embedded in stream_event + assistant message content.
+    cat > "$output_file" << 'EOF'
+{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_1","name":"mcp__codex__codex","input":{}}}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"mcp__codex__codex","input":{"prompt":"hi"}}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"mcp__codex__codex-reply","input":{"threadId":"t1","content":"ok"}}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"---RALPH_STATUS---\nEXIT_SIGNAL: true\n---END_RALPH_STATUS---","session_id":"s-123","permission_denials":[]}
+EOF
+
+    run parse_stream_json_response "$output_file"
+    local result_file=".json_parse_result"
+
+    [[ -f "$result_file" ]] || fail "parse_stream_json_response did not create result file"
+
+    local mcp_calls
+    mcp_calls=$(jq -r '.mcp_calls' "$result_file")
+    assert_equal "$mcp_calls" "2"
+}
+
+@test "analyze_response detects MCP calls from stream-json output" {
+    local output_file="$LOG_DIR/test_output.log"
+
+    cat > "$output_file" << 'EOF'
+{"type":"system","subtype":"init","tools":["mcp__codex__codex","mcp__codex__codex-reply"],"mcp_servers":[{"name":"codex","status":"connected"}]}
+{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_abc","name":"mcp__codex__codex","input":{}}}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_abc","name":"mcp__codex__codex","input":{"prompt":"check"}},{"type":"tool_use","id":"toolu_def","name":"mcp__codex__codex-reply","input":{"threadId":"t1","content":"ok"}}]}}
+{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s-123"}
+EOF
+
+    analyze_response "$output_file" 1
+    assert_file_exists ".response_analysis"
+
+    local output_format
+    output_format=$(jq -r '.output_format' .response_analysis)
+    assert_equal "$output_format" "stream-json"
+
+    local mcp_calls
+    mcp_calls=$(jq -r '.analysis.mcp_calls' .response_analysis)
+    assert_equal "$mcp_calls" "2"
+}
+
 @test "detect_output_format identifies text output" {
     local output_file="$LOG_DIR/test_output.log"
 

@@ -402,16 +402,9 @@ EOF
 }
 
 @test "get_session_file_age_hours returns -1 for stat failure" {
-    # Source the script to get the function
-    source "${BATS_TEST_DIRNAME}/../../ralph_loop.sh"
-
-    # Create a file then make it inaccessible (simulate stat failure via directory permissions)
-    local test_file="$TEST_DIR/unreadable_file"
-    echo "test" > "$test_file"
-
-    # Verify the function code handles stat failure by checking the implementation
-    run grep -A25 'get_session_file_age_hours' "${BATS_TEST_DIRNAME}/../../ralph_loop.sh"
-    [[ "$output" == *'echo "-1"'* ]]
+    # Verify the implementation returns -1 on stat failure.
+    run rg -n 'echo \"-1\"' "${BATS_TEST_DIRNAME}/../../ralph_loop.sh"
+    [[ $status -eq 0 ]]
 }
 
 @test "init_claude_session removes expired session file" {

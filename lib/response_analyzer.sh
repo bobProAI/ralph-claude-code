@@ -273,7 +273,31 @@ parse_stream_json_response() {
     session_id=$(jq -r -s 'map(select(.type=="result")) | last | (.session_id // .sessionId // "")' "$output_file" 2>/dev/null || echo "")
 
     local mcp_calls=0
-    mcp_calls=$(jq -r -s '[.[] | select(.type=="tool_use") | (.name // .tool_name // "") | select(test("^mcp__codex__"))] | length' "$output_file" 2>/dev/null || echo "0")
+    # In stream-json output, tool usage can appear in multiple shapes:
+    # - {"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use", ...}}}
+    # - {"type":"assistant","message":{"content":[{"type":"tool_use", ...}, ...]}}
+    # - (rare) top-level {"type":"tool_use", ...}
+    # Count unique tool_use IDs to avoid double-counting the same call.
+    mcp_calls=$(jq -r -s '
+        def tool_uses:
+            .[]
+            | if .type == "tool_use" then .
+              elif .type == "stream_event"
+                   and (.event.type // "") == "content_block_start"
+                   and (.event.content_block.type // "") == "tool_use"
+                then .event.content_block
+              elif .type == "assistant" and (.message.content? | type) == "array"
+                then (.message.content[]? | select(.type == "tool_use"))
+              else empty end;
+
+        [
+            tool_uses
+            | select((.name // .tool_name // "") | test("^mcp__codex__"))
+            | ((.name // .tool_name // "") + ":" + (.id // .tool_use_id // .toolUseId // ""))
+        ]
+        | unique
+        | length
+    ' "$output_file" 2>/dev/null || echo "0")
     if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
         mcp_calls=0
     fi
