@@ -37,28 +37,38 @@ detect_output_format() {
         return
     fi
 
-    # Check if file starts with { or [ (JSON indicators)
-    local first_char=$(head -c 1 "$output_file" 2>/dev/null | tr -d '[:space:]')
+    # Check if file starts with { or [ (JSON indicators).
+    # Use a small prefix so we don't slurp the whole file.
+    local first_char
+    first_char=$(head -c 1024 "$output_file" 2>/dev/null | tr -d '[:space:]' | head -c 1)
 
     if [[ "$first_char" != "{" && "$first_char" != "[" ]]; then
         echo "text"
         return
     fi
 
-    # Validate as JSON using jq
-    if ! jq empty "$output_file" 2>/dev/null; then
-        echo "text"
+    # Prefer strict jq classification when possible. Stream-json files are multiple JSON texts.
+    # If the output is truncated (common when the outer CLI timeout kills the process), the file may
+    # contain valid JSON lines followed by a partial line. In that case, fall back to line-based detection.
+    if jq -s empty "$output_file" 2>/dev/null; then
+        # Distinguish JSON vs stream-json (multiple JSON texts)
+        local json_text_count
+        json_text_count=$(jq -s 'length' "$output_file" 2>/dev/null || echo "0")
+        if [[ "$json_text_count" =~ ^[0-9]+$ ]] && [[ "$json_text_count" -gt 1 ]]; then
+            echo "stream-json"
+        else
+            echo "json"
+        fi
         return
     fi
 
-    # Distinguish JSON vs stream-json (multiple JSON texts)
-    local json_text_count
-    json_text_count=$(jq -s 'length' "$output_file" 2>/dev/null || echo "0")
-    if [[ "$json_text_count" =~ ^[0-9]+$ ]] && [[ "$json_text_count" -gt 1 ]]; then
+    # Truncated/invalid overall JSON: try parsing line-by-line.
+    if jq -R 'fromjson? | select(type=="object") | .type? // empty' "$output_file" 2>/dev/null | head -n 1 | grep -q .; then
         echo "stream-json"
-    else
-        echo "json"
+        return
     fi
+
+    echo "text"
 }
 
 # Parse JSON response and extract structured fields
@@ -148,10 +158,22 @@ parse_json_response() {
     # NOTE: Claude `--output-format=json` does not include tool_use events.
     # MCP usage must be detected from stream-json output (or stderr MCP debug).
     local mcp_calls=0
+    local mcp_completed_calls=0
+    local mcp_success_calls=0
+    local mcp_error_calls=0
     local mcp_denied=0
     mcp_denied=$(jq -r '[.permission_denials[]? | select(.tool_name | test("^mcp__codex__"))] | length' "$output_file" 2>/dev/null || echo "0")
     if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
         mcp_calls=0
+    fi
+    if ! [[ "$mcp_completed_calls" =~ ^[0-9]+$ ]]; then
+        mcp_completed_calls=0
+    fi
+    if ! [[ "$mcp_success_calls" =~ ^[0-9]+$ ]]; then
+        mcp_success_calls=0
+    fi
+    if ! [[ "$mcp_error_calls" =~ ^[0-9]+$ ]]; then
+        mcp_error_calls=0
     fi
     if ! [[ "$mcp_denied" =~ ^[0-9]+$ ]]; then
         mcp_denied=0
@@ -213,6 +235,9 @@ parse_json_response() {
         --arg session_id "$session_id" \
         --argjson confidence "$confidence" \
         --argjson mcp_calls "$mcp_calls" \
+        --argjson mcp_completed_calls "$mcp_completed_calls" \
+        --argjson mcp_success_calls "$mcp_success_calls" \
+        --argjson mcp_error_calls "$mcp_error_calls" \
         --argjson mcp_denied "$mcp_denied" \
         '{
             status: $status,
@@ -227,11 +252,17 @@ parse_json_response() {
             session_id: $session_id,
             confidence: $confidence,
             mcp_calls: $mcp_calls,
+            mcp_completed_calls: $mcp_completed_calls,
+            mcp_success_calls: $mcp_success_calls,
+            mcp_error_calls: $mcp_error_calls,
             mcp_denied: $mcp_denied,
             metadata: {
                 loop_number: $loop_number,
                 session_id: $session_id,
                 mcp_calls: $mcp_calls,
+                mcp_completed_calls: $mcp_completed_calls,
+                mcp_success_calls: $mcp_success_calls,
+                mcp_error_calls: $mcp_error_calls,
                 mcp_denied: $mcp_denied
             }
         }' > "$result_file"
@@ -250,13 +281,20 @@ parse_stream_json_response() {
         return 1
     fi
 
-    if ! jq -s empty "$output_file" 2>/dev/null; then
-        echo "ERROR: Invalid stream-json in output file" >&2
+    # Stream-json output is newline-delimited JSON. When the Claude process is killed (timeout),
+    # the last line can be truncated, making `jq -s` fail on the whole file. Normalize by
+    # parsing line-by-line, ignoring invalid JSON lines.
+    local normalized_file
+    normalized_file=$(mktemp 2>/dev/null || echo ".json_stream_normalized.$$.$RANDOM")
+    jq -R 'fromjson? | select(type=="object")' "$output_file" > "$normalized_file" 2>/dev/null || true
+    if [[ ! -s "$normalized_file" ]]; then
+        rm -f "$normalized_file" 2>/dev/null || true
+        echo "ERROR: No valid JSON objects found in stream-json output" >&2
         return 1
     fi
 
     local summary
-    summary=$(jq -r -s 'map(select(.type=="result")) | last | .result // ""' "$output_file" 2>/dev/null || echo "")
+    summary=$(jq -r -s 'map(select(.type=="result")) | last | .result // ""' "$normalized_file" 2>/dev/null || echo "")
 
     local exit_signal="false"
     if [[ "$summary" == *"---RALPH_STATUS---"* ]]; then
@@ -270,15 +308,19 @@ parse_stream_json_response() {
     fi
 
     local session_id
-    session_id=$(jq -r -s 'map(select(.type=="result")) | last | (.session_id // .sessionId // "")' "$output_file" 2>/dev/null || echo "")
+    session_id=$(jq -r -s 'map(select(.type=="result")) | last | (.session_id // .sessionId // "")' "$normalized_file" 2>/dev/null || echo "")
 
     local mcp_calls=0
+    local mcp_completed_calls=0
+    local mcp_success_calls=0
+    local mcp_error_calls=0
     # In stream-json output, tool usage can appear in multiple shapes:
     # - {"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use", ...}}}
     # - {"type":"assistant","message":{"content":[{"type":"tool_use", ...}, ...]}}
     # - (rare) top-level {"type":"tool_use", ...}
     # Count unique tool_use IDs to avoid double-counting the same call.
-    mcp_calls=$(jq -r -s '
+    local counts
+    counts=$(jq -r -s '
         def tool_uses:
             .[]
             | if .type == "tool_use" then .
@@ -290,20 +332,38 @@ parse_stream_json_response() {
                 then (.message.content[]? | select(.type == "tool_use"))
               else empty end;
 
-        [
+        def tool_results:
+            .[]
+            | if .type == "user" and (.message.content? | type) == "array"
+                then (.message.content[]? | select(.type == "tool_result"))
+              else empty end;
+
+        def to_set: reduce .[] as $i ({}; .[$i] = true);
+
+        ([
             tool_uses
             | select((.name // .tool_name // "") | test("^mcp__codex__"))
-            | ((.name // .tool_name // "") + ":" + (.id // .tool_use_id // .toolUseId // ""))
-        ]
-        | unique
-        | length
-    ' "$output_file" 2>/dev/null || echo "0")
-    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
-        mcp_calls=0
-    fi
+            | (.id // .tool_use_id // .toolUseId // "")
+        ]) as $all_use_ids
+        | ([ $all_use_ids[] | select(. != "") ] | unique) as $use_ids
+        | ($all_use_ids | map(select(. == "")) | length) as $use_no_id
+        | ($use_ids | to_set) as $use_set
+        | ([tool_results
+              | {id: (.tool_use_id // .toolUseId // ""), is_error: (.is_error // false)}
+           ] | map(select(.id != ""))) as $results
+        | ([ $results[] | select($use_set[.id] == true) | .id ] | unique) as $completed_ids
+        | ([ $results[] | select($use_set[.id] == true and .is_error == true) | .id ] | unique) as $error_ids
+        | ([ $results[] | select($use_set[.id] == true and .is_error != true) | .id ] | unique) as $success_ids
+        | "\(($use_ids|length) + $use_no_id) \($completed_ids|length) \($success_ids|length) \($error_ids|length)"
+    ' "$normalized_file" 2>/dev/null || echo "0 0 0 0")
+    read -r mcp_calls mcp_completed_calls mcp_success_calls mcp_error_calls <<< "$counts"
+    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then mcp_calls=0; fi
+    if ! [[ "$mcp_completed_calls" =~ ^[0-9]+$ ]]; then mcp_completed_calls=0; fi
+    if ! [[ "$mcp_success_calls" =~ ^[0-9]+$ ]]; then mcp_success_calls=0; fi
+    if ! [[ "$mcp_error_calls" =~ ^[0-9]+$ ]]; then mcp_error_calls=0; fi
 
     local mcp_denied=0
-    mcp_denied=$(jq -r -s 'map(select(.type=="result")) | last | [.permission_denials[]? | select((.tool_name // "") | test("^mcp__codex__"))] | length' "$output_file" 2>/dev/null || echo "0")
+    mcp_denied=$(jq -r -s 'map(select(.type=="result")) | last | [.permission_denials[]? | select((.tool_name // "") | test("^mcp__codex__"))] | length' "$normalized_file" 2>/dev/null || echo "0")
     if ! [[ "$mcp_denied" =~ ^[0-9]+$ ]]; then
         mcp_denied=0
     fi
@@ -328,6 +388,9 @@ parse_stream_json_response() {
         --arg session_id "$session_id" \
         --argjson confidence 0 \
         --argjson mcp_calls "$mcp_calls" \
+        --argjson mcp_completed_calls "$mcp_completed_calls" \
+        --argjson mcp_success_calls "$mcp_success_calls" \
+        --argjson mcp_error_calls "$mcp_error_calls" \
         --argjson mcp_denied "$mcp_denied" \
         '{
             status: $status,
@@ -342,15 +405,22 @@ parse_stream_json_response() {
             session_id: $session_id,
             confidence: $confidence,
             mcp_calls: $mcp_calls,
+            mcp_completed_calls: $mcp_completed_calls,
+            mcp_success_calls: $mcp_success_calls,
+            mcp_error_calls: $mcp_error_calls,
             mcp_denied: $mcp_denied,
             metadata: {
                 loop_number: $loop_number,
                 session_id: $session_id,
                 mcp_calls: $mcp_calls,
+                mcp_completed_calls: $mcp_completed_calls,
+                mcp_success_calls: $mcp_success_calls,
+                mcp_error_calls: $mcp_error_calls,
                 mcp_denied: $mcp_denied
             }
         }' > "$result_file"
 
+    rm -f "$normalized_file" 2>/dev/null || true
     return 0
 }
 
@@ -371,6 +441,9 @@ analyze_response() {
     local work_summary=""
     local files_modified=0
     local mcp_calls=0
+    local mcp_completed_calls=0
+    local mcp_success_calls=0
+    local mcp_error_calls=0
     local mcp_denied=0
 
     # Read output file
@@ -409,9 +482,21 @@ analyze_response() {
             local json_confidence=$(jq -r '.confidence' "$json_parse_result_file" 2>/dev/null || echo "0")
             local session_id=$(jq -r '.session_id' "$json_parse_result_file" 2>/dev/null || echo "")
             local mcp_calls=$(jq -r '.mcp_calls // 0' "$json_parse_result_file" 2>/dev/null || echo "0")
+            local mcp_completed_calls=$(jq -r '.mcp_completed_calls // 0' "$json_parse_result_file" 2>/dev/null || echo "0")
+            local mcp_success_calls=$(jq -r '.mcp_success_calls // 0' "$json_parse_result_file" 2>/dev/null || echo "0")
+            local mcp_error_calls=$(jq -r '.mcp_error_calls // 0' "$json_parse_result_file" 2>/dev/null || echo "0")
             local mcp_denied=$(jq -r '.mcp_denied // 0' "$json_parse_result_file" 2>/dev/null || echo "0")
             if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
                 mcp_calls=0
+            fi
+            if ! [[ "$mcp_completed_calls" =~ ^[0-9]+$ ]]; then
+                mcp_completed_calls=0
+            fi
+            if ! [[ "$mcp_success_calls" =~ ^[0-9]+$ ]]; then
+                mcp_success_calls=0
+            fi
+            if ! [[ "$mcp_error_calls" =~ ^[0-9]+$ ]]; then
+                mcp_error_calls=0
             fi
             if ! [[ "$mcp_denied" =~ ^[0-9]+$ ]]; then
                 mcp_denied=0
@@ -455,6 +540,9 @@ analyze_response() {
                 --arg work_summary "$work_summary" \
                 --argjson output_length "$output_length" \
                 --argjson mcp_calls "$mcp_calls" \
+                --argjson mcp_completed_calls "$mcp_completed_calls" \
+                --argjson mcp_success_calls "$mcp_success_calls" \
+                --argjson mcp_error_calls "$mcp_error_calls" \
                 --argjson mcp_denied "$mcp_denied" \
                 '{
                     loop_number: $loop_number,
@@ -462,6 +550,9 @@ analyze_response() {
                     output_file: $output_file,
                     output_format: $output_format,
                     mcp_calls: $mcp_calls,
+                    mcp_completed_calls: $mcp_completed_calls,
+                    mcp_success_calls: $mcp_success_calls,
+                    mcp_error_calls: $mcp_error_calls,
                     mcp_denied: $mcp_denied,
                     analysis: {
                         has_completion_signal: $has_completion_signal,
@@ -474,6 +565,9 @@ analyze_response() {
                         work_summary: $work_summary,
                         output_length: $output_length,
                         mcp_calls: $mcp_calls,
+                        mcp_completed_calls: $mcp_completed_calls,
+                        mcp_success_calls: $mcp_success_calls,
+                        mcp_error_calls: $mcp_error_calls,
                         mcp_denied: $mcp_denied
                     }
                 }' > "$analysis_result_file"

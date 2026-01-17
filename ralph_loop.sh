@@ -342,6 +342,7 @@ should_exit_gracefully() {
     local open_items=0
     local fix_plan_complete="false"
     local mcp_calls=0
+    local mcp_success_calls=0
     local mcp_denied=0
     local mcp_required="true"
     local mcp_ready="false"
@@ -361,15 +362,19 @@ should_exit_gracefully() {
 
     if [[ -f "$RESPONSE_ANALYSIS_FILE" ]]; then
         mcp_calls=$(jq -r '.analysis.mcp_calls // .mcp_calls // 0' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "0")
+        mcp_success_calls=$(jq -r '.analysis.mcp_success_calls // .mcp_success_calls // 0' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "0")
         mcp_denied=$(jq -r '.analysis.mcp_denied // .mcp_denied // 0' "$RESPONSE_ANALYSIS_FILE" 2>/dev/null || echo "0")
     fi
     if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
         mcp_calls=0
     fi
+    if ! [[ "$mcp_success_calls" =~ ^[0-9]+$ ]]; then
+        mcp_success_calls=0
+    fi
     if ! [[ "$mcp_denied" =~ ^[0-9]+$ ]]; then
         mcp_denied=0
     fi
-    if [[ "$mcp_calls" -gt 0 ]]; then
+    if [[ "$mcp_success_calls" -gt 0 ]]; then
         mcp_ready="true"
     fi
     if [[ "$mcp_calls" -le 0 && "$mcp_denied" -gt 0 ]]; then
@@ -393,16 +398,18 @@ should_exit_gracefully() {
                 log_status "WARN" "Exit signal ignored: no fix_plan progress since last loop (open=$open_items)" >&2
             fi
         fi
-        if [[ "$fix_plan_complete" == "true" ]]; then
-            if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
-                log_status "WARN" "Exit signal ignored: no MCP usage detected (mcp_calls=$mcp_calls)" >&2
-            else
-                log_status "SUCCESS" "Exit condition: Claude explicit EXIT_SIGNAL=true in RALPH_STATUS block"
-                echo "exit_signal"
-                return 0
-            fi
+        if [[ "$fix_plan_complete" != "true" ]]; then
+            log_status "WARN" "Exit signal ignored: fix plan incomplete (done+deferred=$((completed_items + deferred_items))/$total_items)" >&2
+            return 1
         fi
-        log_status "WARN" "Exit signal ignored: fix plan incomplete (done+deferred=$((completed_items + deferred_items))/$total_items)" >&2
+        if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
+            log_status "WARN" "Exit signal ignored: Codex MCP review incomplete (mcp_success_calls=$mcp_success_calls)" >&2
+            return 1
+        fi
+
+        log_status "SUCCESS" "Exit condition: Claude explicit EXIT_SIGNAL=true in RALPH_STATUS block"
+        echo "exit_signal"
+        return 0
     fi
 
     if [[ ! -f "$EXIT_SIGNALS_FILE" ]]; then
@@ -436,7 +443,7 @@ should_exit_gracefully() {
     # 3. Multiple "done" signals
     if [[ $recent_done_signals -ge $MAX_CONSECUTIVE_DONE_SIGNALS ]]; then
         if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
-            log_status "WARN" "Exit condition met but blocked (no MCP usage): completion signals ($recent_done_signals >= $MAX_CONSECUTIVE_DONE_SIGNALS)" >&2
+            log_status "WARN" "Exit condition met but blocked (no MCP review): completion signals ($recent_done_signals >= $MAX_CONSECUTIVE_DONE_SIGNALS)" >&2
         else
             log_status "WARN" "Exit condition: Multiple completion signals ($recent_done_signals >= $MAX_CONSECUTIVE_DONE_SIGNALS)"
             echo "completion_signals"
@@ -447,7 +454,7 @@ should_exit_gracefully() {
     # 4. Strong completion indicators (backup heuristic)
     if [[ $recent_completion_indicators -ge 3 ]]; then
         if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
-            log_status "WARN" "Exit condition met but blocked (no MCP usage): completion indicators ($recent_completion_indicators >= 3)" >&2
+            log_status "WARN" "Exit condition met but blocked (no MCP review): completion indicators ($recent_completion_indicators >= 3)" >&2
         else
             log_status "WARN" "Exit condition: Strong completion indicators ($recent_completion_indicators >= 3)" >&2
             echo "project_complete"
@@ -458,7 +465,7 @@ should_exit_gracefully() {
     # 4. Check fix_plan.md for completion
     if [[ "$fix_plan_complete" == "true" ]]; then
         if [[ "$mcp_required" == "true" && "$mcp_ready" != "true" ]]; then
-            log_status "WARN" "Exit condition met but blocked (no MCP usage): fix plan complete (done+deferred=$((completed_items + deferred_items))/$total_items)" >&2
+            log_status "WARN" "Exit condition met but blocked (no MCP review): fix plan complete (done+deferred=$((completed_items + deferred_items))/$total_items)" >&2
         else
             log_status "WARN" "Exit condition: All fix_plan.md items completed ($((completed_items + deferred_items))/$total_items)" >&2
             echo "plan_complete"
@@ -1006,12 +1013,12 @@ update_review_state_from_analysis() {
         return 0
     fi
 
-    local mcp_calls=0
-    mcp_calls=$(jq -r '.analysis.mcp_calls // .mcp_calls // 0' "$analysis_file" 2>/dev/null || echo "0")
-    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
-        mcp_calls=0
+    local mcp_success_calls=0
+    mcp_success_calls=$(jq -r '.analysis.mcp_success_calls // .mcp_success_calls // 0' "$analysis_file" 2>/dev/null || echo "0")
+    if ! [[ "$mcp_success_calls" =~ ^[0-9]+$ ]]; then
+        mcp_success_calls=0
     fi
-    if [[ "$mcp_calls" -le 0 ]]; then
+    if [[ "$mcp_success_calls" -le 0 ]]; then
         if review_marker_present "$analysis_file"; then
             log_status "WARN" "Review claim detected without MCP usage; ignoring review state update" >&2
         fi
@@ -1116,22 +1123,22 @@ enforce_mcp_review_only() {
         return 0
     fi
 
-    local mcp_calls=0
+    local mcp_success_calls=0
     local mcp_denied=0
-    mcp_calls=$(jq -r '.analysis.mcp_calls // .mcp_calls // 0' "$analysis_file" 2>/dev/null || echo "0")
+    mcp_success_calls=$(jq -r '.analysis.mcp_success_calls // .mcp_success_calls // 0' "$analysis_file" 2>/dev/null || echo "0")
     mcp_denied=$(jq -r '.analysis.mcp_denied // .mcp_denied // 0' "$analysis_file" 2>/dev/null || echo "0")
-    if ! [[ "$mcp_calls" =~ ^[0-9]+$ ]]; then
-        mcp_calls=0
+    if ! [[ "$mcp_success_calls" =~ ^[0-9]+$ ]]; then
+        mcp_success_calls=0
     fi
     if ! [[ "$mcp_denied" =~ ^[0-9]+$ ]]; then
         mcp_denied=0
     fi
 
-    if [[ "$mcp_calls" -le 0 ]]; then
+    if [[ "$mcp_success_calls" -le 0 ]]; then
         if [[ "$mcp_denied" -gt 0 ]]; then
             log_status "ERROR" "Review-only mode failed: MCP call denied by permissions (mcp_denied=$mcp_denied)" >&2
         else
-            log_status "ERROR" "Review-only mode failed: no MCP calls detected (mcp_calls=0)" >&2
+            log_status "ERROR" "Review-only mode failed: no successful Codex MCP calls detected (mcp_success_calls=0)" >&2
         fi
         return 4
     fi
@@ -1578,6 +1585,127 @@ update_session_last_used() {
 # Global array for Claude command arguments (avoids shell injection)
 declare -a CLAUDE_CMD_ARGS=()
 
+# Resolve absolute path for the configured STATE_DIR.
+get_state_dir_abs() {
+    local state_dir="${STATE_DIR:-.}"
+    (cd "$state_dir" 2>/dev/null && pwd -P) || pwd -P
+}
+
+# Best-effort repo root (git top-level); falls back to state dir.
+get_repo_root_abs() {
+    local state_dir_abs=$1
+    git -C "$state_dir_abs" rev-parse --show-toplevel 2>/dev/null || echo "$state_dir_abs"
+}
+
+# Derive CP number from state directory name, falling back to scanning PROMPT.md.
+get_current_cp_number() {
+    local state_dir_abs=$1
+    local base
+    base=$(basename "$state_dir_abs")
+    if [[ "$base" =~ ^CP-[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "$base"
+        return 0
+    fi
+
+    local prompt_path="$state_dir_abs/$PROMPT_FILE"
+    if [[ -f "$prompt_path" ]]; then
+        local from_prompt=""
+        from_prompt=$(grep -Eo 'CP-[0-9]+(\.[0-9]+)?' "$prompt_path" 2>/dev/null | head -1 || true)
+        if [[ -n "$from_prompt" ]]; then
+            echo "$from_prompt"
+            return 0
+        fi
+    fi
+
+    echo ""
+    return 0
+}
+
+build_review_only_user_prompt() {
+    local state_dir_abs
+    state_dir_abs=$(get_state_dir_abs)
+    local repo_root_abs
+    repo_root_abs=$(get_repo_root_abs "$state_dir_abs")
+    local cp_number
+    cp_number=$(get_current_cp_number "$state_dir_abs")
+
+    local fix_plan_path="$FIX_PLAN_FILE"
+    if [[ "$fix_plan_path" != /* ]]; then
+        fix_plan_path="$state_dir_abs/$fix_plan_path"
+    fi
+
+    local cp_docs=()
+    if [[ -n "$cp_number" ]]; then
+        while IFS= read -r f; do
+            cp_docs+=("$f")
+        done < <(ls -1 "$repo_root_abs/docs/change_proposals/${cp_number}-"*.md 2>/dev/null || true)
+    fi
+
+    local cp_docs_block="(none found)"
+    if (( ${#cp_docs[@]} > 0 )); then
+        cp_docs_block=""
+        for f in "${cp_docs[@]}"; do
+            cp_docs_block+=$'- '"$f"$'\n'
+        done
+    fi
+
+    local task_json_path=""
+    if [[ -n "$cp_number" ]]; then
+        task_json_path="$repo_root_abs/docs/change_proposals/${cp_number}-task.json"
+    fi
+
+    cat << EOF
+You are running Ralph in REVIEW-ONLY mode.
+
+Hard requirements:
+1) Make EXACTLY ONE tool call total: \`mcp__codex__codex\`.
+2) Tool input must include:
+   - \`prompt\`: the delegation prompt below
+   - \`cwd\`: \`$repo_root_abs\`
+   - \`sandbox\`: \`read-only\`
+3) Do NOT call \`mcp__codex__codex-reply\` or any other tools.
+4) After the tool returns, output ONLY:
+   - A short "Codex Review" section containing the returned \`content\` text
+   - A \`---RALPH_STATUS---\` block with \`EXIT_SIGNAL: true\`
+5) If the tool call errors or times out, output exactly: \`FAIL: MCP_REQUIRED\` (and nothing else).
+
+Delegation prompt to Codex (advisory / read-only):
+
+## 1. TASK
+Perform a final advisory code review for ${cp_number:-this CP} in \`bob_party\`, focused on whether the work is actually complete for human review.
+
+## 2. EXPECTED OUTCOME
+1) A ranked list of issues (if any) with concrete evidence (file paths).
+2) A clear verdict: PASS / NEEDS_FIXES / BLOCKED.
+
+## 3. CONTEXT
+- Repo root: \`$repo_root_abs\`
+- Ralph state dir: \`$state_dir_abs\`
+- Fix plan file: \`$fix_plan_path\`
+- CP doc candidates:
+$cp_docs_block
+- Task JSON (expected): \`$task_json_path\`
+
+## 4. CONSTRAINTS
+- Advisory only: do not modify files.
+- Do not run tests/commands in this review-only delegation.
+- Treat \`[x]\` and \`[d]\` as complete for loop exit gating.
+
+## 5. MUST DO
+- Read the fix plan and summarize totals for \`[x]\`/\`[d]\`/\`[~]\`/\`[ ]\`.
+- Verify whether \`apps/sidecar-extension/src/overlay.tsx\` exists.
+- Check CP doc + task JSON exist (report missing if not).
+
+## 6. MUST NOT DO
+- Do not claim tests passed unless you actually ran them.
+
+## 7. OUTPUT FORMAT
+- Summary (2-4 sentences)
+- Issues (bullets; include file paths)
+- Verdict: PASS / NEEDS_FIXES / BLOCKED
+EOF
+}
+
 # Build Claude CLI command with modern flags using array (shell-injection safe)
 # Populates global CLAUDE_CMD_ARGS array for direct execution
 # Uses -p flag with prompt content (Claude CLI does not have --prompt-file)
@@ -1635,8 +1763,8 @@ build_claude_command() {
     local effective_tools="$CLAUDE_ALLOWED_TOOLS"
     if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
         # MCP tools are namespaced as mcp__<server>__<tool>
-        # Codex MCP server exposes `codex` and `codex-reply`.
-        effective_tools="mcp__codex__codex,mcp__codex__codex-reply"
+        # Codex MCP server exposes `codex` and `codex-reply`, but review-only should be single-call.
+        effective_tools="mcp__codex__codex"
     fi
     if [[ -n "$effective_tools" ]]; then
         CLAUDE_CMD_ARGS+=("--allowedTools")
@@ -1708,7 +1836,11 @@ build_claude_command() {
     # Note: Claude CLI uses -p for prompts, not --prompt-file (which doesn't exist)
     # Array-based approach maintains shell injection safety
     local prompt_content
-    prompt_content=$(cat "$prompt_file")
+    if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+        prompt_content=$(build_review_only_user_prompt)
+    else
+        prompt_content=$(cat "$prompt_file")
+    fi
     CLAUDE_CMD_ARGS+=("-p" "$prompt_content")
 }
 
@@ -2278,7 +2410,7 @@ main() {
             break
         elif [ $exec_result -eq 4 ]; then
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "mcp_required" "failed" "review_only_no_mcp"
-            log_status "ERROR" "🛑 Review-only run failed: no Codex MCP usage detected"
+            log_status "ERROR" "🛑 Review-only run failed: no successful Codex MCP usage detected"
             main_exit_code=4
             break
         elif [ $exec_result -eq 2 ]; then
