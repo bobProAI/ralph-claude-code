@@ -43,6 +43,8 @@ init_circuit_breaker() {
     "consecutive_no_progress": 0,
     "consecutive_same_error": 0,
     "last_progress_loop": 0,
+    "last_signature": "",
+    "last_error_signature": "",
     "total_opens": 0,
     "reason": ""
 }
@@ -83,12 +85,39 @@ can_execute() {
     fi
 }
 
+# Prime circuit breaker with a baseline signature.
+# This avoids treating pre-existing diffs as "progress" and lets loop-1 detect progress vs baseline.
+prime_circuit_breaker_signature() {
+    local signature=${1:-}
+
+    init_circuit_breaker
+
+    if [[ -z "$signature" ]]; then
+        return 0
+    fi
+
+    local existing_signature=""
+    existing_signature=$(jq -r '.last_signature // ""' "$CB_STATE_FILE" 2>/dev/null || echo "")
+    if [[ -n "$existing_signature" ]]; then
+        return 0
+    fi
+
+    local tmp_file="${CB_STATE_FILE}.tmp"
+    if jq --arg sig "$signature" '.last_signature = $sig' "$CB_STATE_FILE" > "$tmp_file" 2>/dev/null; then
+        mv "$tmp_file" "$CB_STATE_FILE"
+    else
+        rm -f "$tmp_file"
+    fi
+}
+
 # Record loop execution result
 record_loop_result() {
     local loop_number=$1
     local files_changed=$2
     local has_errors=$3
     local output_length=$4
+    local progress_signature=${5:-}
+    local error_signature=${6:-}
 
     init_circuit_breaker
 
@@ -97,6 +126,8 @@ record_loop_result() {
     local consecutive_no_progress=$(echo "$state_data" | jq -r '.consecutive_no_progress' | tr -d '[:space:]')
     local consecutive_same_error=$(echo "$state_data" | jq -r '.consecutive_same_error' | tr -d '[:space:]')
     local last_progress_loop=$(echo "$state_data" | jq -r '.last_progress_loop' | tr -d '[:space:]')
+    local last_signature=$(echo "$state_data" | jq -r '.last_signature // ""')
+    local last_error_signature=$(echo "$state_data" | jq -r '.last_error_signature // ""')
 
     # Ensure integers
     consecutive_no_progress=$((consecutive_no_progress + 0))
@@ -105,19 +136,43 @@ record_loop_result() {
 
     # Detect progress
     local has_progress=false
-    if [[ $files_changed -gt 0 ]]; then
-        has_progress=true
-        consecutive_no_progress=0
-        last_progress_loop=$loop_number
+    if [[ -n "$progress_signature" ]]; then
+        if [[ -z "$last_signature" ]]; then
+            # First observation: establish baseline only (no comparison possible).
+            last_signature="$progress_signature"
+        elif [[ "$progress_signature" != "$last_signature" ]]; then
+            has_progress=true
+            consecutive_no_progress=0
+            last_progress_loop=$loop_number
+            last_signature="$progress_signature"
+        else
+            consecutive_no_progress=$((consecutive_no_progress + 1))
+        fi
     else
-        consecutive_no_progress=$((consecutive_no_progress + 1))
+        if [[ $files_changed -gt 0 ]]; then
+            has_progress=true
+            consecutive_no_progress=0
+            last_progress_loop=$loop_number
+        else
+            consecutive_no_progress=$((consecutive_no_progress + 1))
+        fi
     fi
 
     # Detect same error repetition
     if [[ "$has_errors" == "true" ]]; then
-        consecutive_same_error=$((consecutive_same_error + 1))
+        if [[ -n "$error_signature" ]]; then
+            if [[ -n "$last_error_signature" && "$error_signature" == "$last_error_signature" ]]; then
+                consecutive_same_error=$((consecutive_same_error + 1))
+            else
+                consecutive_same_error=1
+            fi
+            last_error_signature="$error_signature"
+        else
+            consecutive_same_error=$((consecutive_same_error + 1))
+        fi
     else
         consecutive_same_error=0
+        last_error_signature=""
     fi
 
     # Determine new state and reason
@@ -171,6 +226,8 @@ record_loop_result() {
     "consecutive_no_progress": $consecutive_no_progress,
     "consecutive_same_error": $consecutive_same_error,
     "last_progress_loop": $last_progress_loop,
+    "last_signature": "$last_signature",
+    "last_error_signature": "$last_error_signature",
     "total_opens": $total_opens,
     "reason": "$reason",
     "current_loop": $loop_number
@@ -279,6 +336,8 @@ reset_circuit_breaker() {
     "consecutive_no_progress": 0,
     "consecutive_same_error": 0,
     "last_progress_loop": 0,
+    "last_signature": "",
+    "last_error_signature": "",
     "total_opens": 0,
     "reason": "$reason"
 }
@@ -322,6 +381,7 @@ should_halt_execution() {
 export -f init_circuit_breaker
 export -f get_circuit_state
 export -f can_execute
+export -f prime_circuit_breaker_signature
 export -f record_loop_result
 export -f show_circuit_status
 export -f reset_circuit_breaker

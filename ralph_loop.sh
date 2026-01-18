@@ -31,13 +31,17 @@ MAX_CALLS_PER_HOUR=100  # Adjust based on your plan
 VERBOSE_PROGRESS=false  # Default: no verbose progress updates
 CLAUDE_TIMEOUT_MINUTES=15  # Default: 15 minutes timeout for Claude Code execution
 SLEEP_DURATION=3600     # 1 hour in seconds
+RETRY_SLEEP_SECONDS="${RALPH_RETRY_SLEEP_SECONDS:-30}"  # Delay between failed loops (configurable)
+if ! [[ "$RETRY_SLEEP_SECONDS" =~ ^[0-9]+$ ]]; then
+    RETRY_SLEEP_SECONDS=30
+fi
 # Note: These file names are prefixed with STATE_DIR after arg parsing
 CALL_COUNT_FILE_NAME=".call_count"
 TIMESTAMP_FILE_NAME=".last_reset"
 USE_TMUX=false
 
 # Modern Claude CLI configuration (Phase 1.1)
-CLAUDE_OUTPUT_FORMAT="json"              # Options: json, text
+CLAUDE_OUTPUT_FORMAT="json"              # Options: json, stream-json, text
 CLAUDE_ALLOWED_TOOLS="Read,Write,Bash(git *),Bash(pnpm *)"  # Comma-separated list of allowed tools
 CLAUDE_USE_CONTINUE=true                 # Enable session continuity
 CLAUDE_SESSION_FILE_NAME=".claude_session_id" # Session ID persistence file (prefixed with STATE_DIR)
@@ -225,6 +229,7 @@ init_call_tracking() {
 
     # Initialize circuit breaker
     init_circuit_breaker
+    prime_circuit_breaker_signature "$(get_repo_change_signature)"
 
     log_status "INFO" "DEBUG: Completed init_call_tracking successfully"
 }
@@ -938,6 +943,36 @@ update_fix_plan_progress_state() {
             last_changed_ts: $last_changed_ts,
             last_changed_loop: $last_changed_loop
         }' > "$FIX_PLAN_PROGRESS_FILE" 2>/dev/null || true
+}
+
+get_repo_change_signature() {
+    # Returns a stable signature of the repo changes across loops.
+    # Uses content-based diffs (vs name-only) so repeated edits to the same files count as progress.
+    # Includes untracked file contents (excluding ignored files) so new files and their edits count too.
+    if ! command -v git >/dev/null 2>&1; then
+        echo ""
+        return 0
+    fi
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        echo ""
+        return 0
+    fi
+
+    local diff_sig=""
+    diff_sig=$(git diff --no-ext-diff --binary HEAD 2>/dev/null | cksum | awk '{print $1 "-" $2}' || true)
+
+    local untracked_sig="0-0"
+    local untracked_files=""
+    untracked_files=$(git ls-files --others --exclude-standard 2>/dev/null || true)
+    if [[ -n "$untracked_files" ]]; then
+        untracked_sig=$(
+            printf "%s\n" "$untracked_files" | while IFS= read -r file_path; do
+                cksum "$file_path" 2>/dev/null || true
+            done | cksum | awk '{print $1 "-" $2}' || true
+        )
+    fi
+
+    echo "${diff_sig}|untracked:${untracked_sig}"
 }
 
 # Review state helpers
@@ -1728,18 +1763,25 @@ build_claude_command() {
 
     # Add output format flag
     # In review-only mode we need `stream-json` to reliably observe tool_use events.
-    if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
-        local cli_output_format="json"
+    if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" || "$CLAUDE_OUTPUT_FORMAT" == "stream-json" ]]; then
+        local cli_output_format="$CLAUDE_OUTPUT_FORMAT"
         if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
             cli_output_format="stream-json"
         fi
         CLAUDE_CMD_ARGS+=("--output-format" "$cli_output_format")
+        if [[ "$cli_output_format" == "stream-json" ]]; then
+            CLAUDE_CMD_ARGS+=("--include-partial-messages")
+            # Claude requires --verbose when using --print/-p with stream-json output.
+            # Ralph always uses -p, so ensure stream-json runs don't immediately fail.
+            if [[ "$CODEX_REVIEW_ONLY" != "true" ]]; then
+                CLAUDE_CMD_ARGS+=("--verbose")
+            fi
+        fi
         # Review-only runs should be fully deterministic and observable:
         # - `--include-partial-messages` is required for tool_use events in stream-json output.
         # - `--no-session-persistence` avoids anchoring on prior sessions and prevents writes.
         # - Claude requires `--verbose` with `--print` + `--output-format=stream-json`.
         if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
-            CLAUDE_CMD_ARGS+=("--include-partial-messages")
             CLAUDE_CMD_ARGS+=("--no-session-persistence")
             CLAUDE_CMD_ARGS+=("--verbose")
         fi
@@ -1874,16 +1916,20 @@ execute_claude_code() {
         REVIEW_ONLY_RETRY_DONE="true"
     fi
 
-    local attempt=0
-    local analysis_exit_code=0
-    while true; do
-        attempt=$((attempt + 1))
-        calls_made=$((calls_made + 1))
-
-        local timestamp
-        timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
-        local attempt_suffix=""
-        if [[ $attempt -gt 1 ]]; then
+	    local attempt=0
+	    local analysis_exit_code=0
+	    while true; do
+	        attempt=$((attempt + 1))
+	        calls_made=$((calls_made + 1))
+	
+	        # Count attempted calls even when Claude fails/timeouts.
+	        # This prevents runaway retries bypassing the per-hour call budget.
+	        echo "$calls_made" > "$CALL_COUNT_FILE"
+	
+	        local timestamp
+	        timestamp=$(date '+%Y-%m-%d_%H-%M-%S')
+	        local attempt_suffix=""
+	        if [[ $attempt -gt 1 ]]; then
             attempt_suffix="_retry${attempt}"
         fi
         output_file="$LOG_DIR/claude_output_${timestamp}${attempt_suffix}.log"
@@ -1897,7 +1943,7 @@ execute_claude_code() {
         # For backward compatibility, fall back to stdin piping for text mode
         local use_modern_cli=false
 
-        if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" ]]; then
+        if [[ "$CLAUDE_OUTPUT_FORMAT" == "json" || "$CLAUDE_OUTPUT_FORMAT" == "stream-json" ]]; then
             # Modern approach: use CLI flags (builds CLAUDE_CMD_ARGS array)
             if build_claude_command "$PROMPT_FILE" "$loop_context" "$session_id"; then
                 use_modern_cli=true
@@ -2011,26 +2057,54 @@ EOF
             fi
         fi
 
-        if [ $exit_code -ne 0 ]; then
-            # Clear progress file on failure
-            echo '{"status": "failed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
-
-            # Check if the failure is due to API 5-hour limit
-            if [[ "$rate_limit_detected" == "true" ]] || grep -qi "5.*hour.*limit\|limit.*reached.*try.*back\|usage.*limit.*reached" "$output_file" "$stderr_file" 2>/dev/null; then
-                log_status "ERROR" "🚫 Claude API 5-hour usage limit reached"
-                return 2  # Special return code for API limit
+	        if [ $exit_code -ne 0 ]; then
+	            # Clear progress file on failure
+	            echo '{"status": "failed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
+	
+	            # Detect timeout exit codes for clearer diagnosis.
+	            if [[ $exit_code -eq 124 ]]; then
+	                log_status "ERROR" "⏱️ Claude Code timed out after ${CLAUDE_TIMEOUT_MINUTES}m (exit_code=124)"
+	            fi
+	
+	            # Check if the failure is due to API 5-hour limit
+	            if [[ "$rate_limit_detected" == "true" ]] || grep -qi "5.*hour.*limit\|limit.*reached.*try.*back\|usage.*limit.*reached" "$output_file" "$stderr_file" 2>/dev/null; then
+	                log_status "ERROR" "🚫 Claude API 5-hour usage limit reached"
+	                return 2  # Special return code for API limit
             fi
 
-            if [[ -s "$stderr_file" ]]; then
-                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file (stderr: $stderr_file)"
-            else
-                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
-            fi
-            return 1
-        fi
-
-        # Only increment counter on successful execution
-        echo "$calls_made" > "$CALL_COUNT_FILE"
+	            if [[ -s "$stderr_file" ]]; then
+	                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file (stderr: $stderr_file)"
+	            else
+	                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
+	            fi
+	
+	            # Feed failures into the circuit breaker to avoid infinite retry loops when
+	            # Claude can't produce output (e.g., repeated timeouts or permission deadlocks).
+	            local files_changed
+	            files_changed=$(git diff --name-only HEAD 2>/dev/null | wc -l || echo 0)
+	            local progress_signature
+	            progress_signature=$(get_repo_change_signature)
+	            local output_len_stdout output_len_stderr output_length
+	            output_len_stdout=$(wc -c < "$output_file" 2>/dev/null || echo 0)
+	            output_len_stderr=$(wc -c < "$stderr_file" 2>/dev/null || echo 0)
+	            output_length=$((output_len_stdout + output_len_stderr))
+	            local error_signature
+	            error_signature=$(
+	                printf 'exit_code:%s|' "$exit_code"
+	                cat "$stderr_file" "$output_file" 2>/dev/null | head -c 4096 | cksum | awk '{print $1 "-" $2}' || true
+	            )
+	
+	            record_loop_result "$loop_count" "$files_changed" "true" "$output_length" "$progress_signature" "$error_signature"
+	            local circuit_result=$?
+	            if [[ $circuit_result -ne 0 ]]; then
+	                log_status "WARN" "Circuit breaker opened - halting execution"
+	                return 3  # Special code for circuit breaker trip
+	            fi
+	            return 1
+	        fi
+	
+	        # Call counter already persisted at attempt start; keep this write for safety.
+	        echo "$calls_made" > "$CALL_COUNT_FILE"
 
         # Clear progress file
         echo '{"status": "completed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
@@ -2092,7 +2166,9 @@ EOF
         fi
 
         # Get file change count for circuit breaker
-        local files_changed=$(git diff --name-only 2>/dev/null | wc -l || echo 0)
+        local files_changed=$(git diff --name-only HEAD 2>/dev/null | wc -l || echo 0)
+        local progress_signature
+        progress_signature=$(get_repo_change_signature)
         local has_errors="false"
 
         # Two-stage error detection to avoid JSON field false positives
@@ -2118,9 +2194,15 @@ EOF
             log_status "WARN" "Errors detected in output, check: $output_file"
         fi
         local output_length=$(wc -c < "$output_file" 2>/dev/null || echo 0)
+        local error_signature=""
+        if [[ "$has_errors" == "true" ]]; then
+            error_signature=$(
+                cat "$stderr_file" "$output_file" 2>/dev/null | head -c 4096 | cksum | awk '{print $1 "-" $2}' || true
+            )
+        fi
 
         # Record result in circuit breaker
-        record_loop_result "$loop_count" "$files_changed" "$has_errors" "$output_length"
+        record_loop_result "$loop_count" "$files_changed" "$has_errors" "$output_length" "$progress_signature" "$error_signature"
         local circuit_result=$?
 
         if [[ $circuit_result -ne 0 ]]; then
@@ -2201,12 +2283,12 @@ cleanup_on_exit() {
 }
 
 # SIGINT/SIGTERM handler - sets status before exit triggers EXIT trap
-cleanup() {
-    if [[ "$STATE_PATHS_READY" != "true" ]]; then
-        exit 0
-    fi
-
-    log_status "INFO" "Ralph loop interrupted by signal. Cleaning up..."
+	cleanup() {
+	    if [[ "$STATE_PATHS_READY" != "true" ]]; then
+	        exit 0
+	    fi
+	
+	    log_status "INFO" "Ralph loop interrupted by signal. Cleaning up..."
 
     # Mark that signal handler is doing cleanup
     SIGNAL_CLEANUP_DONE=true
@@ -2217,12 +2299,13 @@ cleanup() {
         last_action=$(jq -r '.last_action // ""' "$STATUS_FILE" 2>/dev/null || echo "")
     fi
 
-    if [[ "$last_action" != "graceful_exit" ]]; then
-        reset_session "manual_interrupt"
-        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped" "signal_interrupt"
-    fi
-    exit 0
-}
+	    if [[ "$last_action" != "graceful_exit" ]]; then
+	        reset_session "manual_interrupt"
+	        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped" "signal_interrupt"
+	        echo '{"status": "stopped", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE" 2>/dev/null || true
+	    fi
+	    exit 0
+	}
 
 # Set up signal handlers
 # EXIT trap uses cleanup_on_exit for comprehensive handling
@@ -2499,8 +2582,8 @@ main() {
             fi
         else
             update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
-            log_status "WARN" "Execution failed, waiting 30 seconds before retry..."
-            sleep 30
+            log_status "WARN" "Execution failed, waiting ${RETRY_SLEEP_SECONDS}s before retry..."
+            sleep "$RETRY_SLEEP_SECONDS"
         fi
         
         log_status "LOOP" "=== Completed Loop #$loop_count ==="
@@ -2532,7 +2615,7 @@ Options:
     --reset-review-state    Reset review count state and exit
 
 Modern CLI Options (Phase 1.1):
-    --output-format FORMAT  Set Claude output format: json or text (default: $CLAUDE_OUTPUT_FORMAT)
+    --output-format FORMAT  Set Claude output format: json, stream-json, or text (default: $CLAUDE_OUTPUT_FORMAT)
     --allowed-tools TOOLS   Comma-separated list of allowed tools (default: $CLAUDE_ALLOWED_TOOLS)
                             Supports scoped tokens: Read(<glob>), Write(<glob>), Edit(<glob>)
     --permission-mode MODE  Set Claude CLI permission mode (default: unset)
@@ -2656,10 +2739,10 @@ HELPEOF
 	            exit 0
 	            ;;
         --output-format)
-            if [[ "$2" == "json" || "$2" == "text" ]]; then
+            if [[ "$2" == "json" || "$2" == "stream-json" || "$2" == "text" ]]; then
                 CLAUDE_OUTPUT_FORMAT="$2"
             else
-                echo "Error: --output-format must be 'json' or 'text'"
+                echo "Error: --output-format must be 'json', 'stream-json', or 'text'"
                 exit 1
             fi
             shift 2
