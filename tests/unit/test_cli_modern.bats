@@ -206,6 +206,12 @@ teardown() {
     [[ "$output" != *"Unknown option"* ]] || skip "--no-continue flag not yet implemented"
 }
 
+@test "--continue flag enables session continuity" {
+    run bash -c "source ${BATS_TEST_DIRNAME}/../../ralph_loop.sh --continue --help 2>&1 || true"
+
+    [[ "$output" != *"Unknown option"* ]] || skip "--continue flag not yet implemented"
+}
+
 # =============================================================================
 # BUILD_LOOP_CONTEXT TESTS
 # =============================================================================
@@ -416,6 +422,12 @@ EOF
     run bash "${BATS_TEST_DIRNAME}/../../ralph_loop.sh" --help
 
     [[ "$output" == *"no-continue"* ]] || skip "--no-continue help not yet added"
+}
+
+@test "show_help includes --continue option" {
+    run bash "${BATS_TEST_DIRNAME}/../../ralph_loop.sh" --help
+
+    [[ "$output" == *" --continue "* ]] || [[ "$output" == *"--continue"* ]] || skip "--continue help not yet added"
 }
 
 # =============================================================================

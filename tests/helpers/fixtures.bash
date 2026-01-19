@@ -334,6 +334,8 @@ create_sample_progress_executing() {
     "status": "executing",
     "indicator": "⠋",
     "elapsed_seconds": 120,
+    "output_format": "json",
+    "last_output_preview": "Analyzing code structure...",
     "last_output": "Analyzing code structure...",
     "timestamp": "2025-09-30 12:05:00"
 }

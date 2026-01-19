@@ -26,6 +26,7 @@ LOG_DIR_NAME="logs"
 DOCS_DIR_NAME="docs/generated"
 STATUS_FILE_NAME="status.json"
 PROGRESS_FILE_NAME="progress.json"
+FAILURE_STATE_FILE_NAME=".failure_state.json"
 CLAUDE_CODE_CMD="claude"
 MAX_CALLS_PER_HOUR=100  # Adjust based on your plan
 VERBOSE_PROGRESS=false  # Default: no verbose progress updates
@@ -134,6 +135,7 @@ setup_state_paths() {
     CB_HISTORY_FILE="$STATE_DIR/.circuit_breaker_history"
     RESPONSE_ANALYSIS_FILE="$STATE_DIR/.response_analysis"
     JSON_PARSE_RESULT_FILE="$STATE_DIR/.json_parse_result"
+    FAILURE_STATE_FILE="$STATE_DIR/$FAILURE_STATE_FILE_NAME"
 
     # Initialize directories under STATE_DIR
     mkdir -p "$LOG_DIR" "$DOCS_DIR"
@@ -260,19 +262,125 @@ update_status() {
     local last_action=$3
     local status=$4
     local exit_reason=${5:-""}
-    
-    cat > "$STATUS_FILE" << STATUSEOF
-{
-    "timestamp": "$(get_iso_timestamp)",
-    "loop_count": $loop_count,
-    "calls_made_this_hour": $calls_made,
-    "max_calls_per_hour": $MAX_CALLS_PER_HOUR,
-    "last_action": "$last_action",
-    "status": "$status",
-    "exit_reason": "$exit_reason",
-    "next_reset": "$(get_next_hour_time)"
+    local provider_rate_limit_reset_hint=${6:-""}
+    local provider_rate_limit_reset_at=${7:-""}
+
+    if ! [[ "$loop_count" =~ ^[0-9]+$ ]]; then
+        loop_count=0
+    fi
+    if ! [[ "$calls_made" =~ ^[0-9]+$ ]]; then
+        calls_made=0
+    fi
+
+    local next_call_budget_reset
+    next_call_budget_reset="$(get_next_hour_time)"
+
+    # Always write status atomically so monitors never read a partially-written file.
+    local tmp_file="${STATUS_FILE}.tmp"
+    jq -n \
+        --arg timestamp "$(get_iso_timestamp)" \
+        --argjson loop_count "$loop_count" \
+        --argjson calls_made_this_hour "$calls_made" \
+        --argjson max_calls_per_hour "$MAX_CALLS_PER_HOUR" \
+        --arg last_action "$last_action" \
+        --arg status "$status" \
+        --arg exit_reason "$exit_reason" \
+        --arg next_call_budget_reset "$next_call_budget_reset" \
+        --arg provider_rate_limit_reset_hint "$provider_rate_limit_reset_hint" \
+        --arg provider_rate_limit_reset_at "$provider_rate_limit_reset_at" \
+        '{
+            timestamp: $timestamp,
+            loop_count: $loop_count,
+            calls_made_this_hour: $calls_made_this_hour,
+            max_calls_per_hour: $max_calls_per_hour,
+            last_action: $last_action,
+            status: $status,
+            exit_reason: $exit_reason,
+
+            # Backwards-compatible alias for "call budget resets next hour"
+            next_reset: $next_call_budget_reset,
+            next_call_budget_reset: $next_call_budget_reset,
+
+            # Provider quota reset timing is only populated when we have an explicit hint/time.
+            provider_rate_limit_reset_hint: (if $provider_rate_limit_reset_hint == "" then null else $provider_rate_limit_reset_hint end),
+            provider_rate_limit_reset_at: (if $provider_rate_limit_reset_at == "" then null else $provider_rate_limit_reset_at end)
+        }' > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$STATUS_FILE"
 }
-STATUSEOF
+
+detect_failure_class() {
+    local exit_code="$1"
+    local output_file="$2"
+    local stderr_file="$3"
+
+    if [[ "$exit_code" -eq 124 ]]; then
+        echo "claude_outer_timeout"
+        return 0
+    fi
+
+    if grep -qiE "MCP tool call '.*' timed out after|MCP tool call .* timed out after" "$output_file" "$stderr_file" 2>/dev/null; then
+        echo "mcp_tool_timeout"
+        return 0
+    fi
+
+    if grep -qiE "Session not found for thread_id" "$output_file" "$stderr_file" 2>/dev/null; then
+        echo "mcp_thread_not_found"
+        return 0
+    fi
+
+    if grep -qiE "Invalid API key|Please run /login|run /login|not authenticated" "$output_file" "$stderr_file" 2>/dev/null; then
+        echo "auth_or_config"
+        return 0
+    fi
+
+    echo "unknown_failure"
+}
+
+update_failure_state() {
+    local failure_class="$1"
+    local exit_code="$2"
+    local output_file="$3"
+    local stderr_file="$4"
+
+    local prev_class=""
+    local prev_count=0
+    if [[ -f "$FAILURE_STATE_FILE" ]]; then
+        prev_class=$(jq -r '.last_failure_class // ""' "$FAILURE_STATE_FILE" 2>/dev/null || echo "")
+        prev_count=$(jq -r '.consecutive_same_class // 0' "$FAILURE_STATE_FILE" 2>/dev/null || echo "0")
+    fi
+    if ! [[ "$prev_count" =~ ^[0-9]+$ ]]; then
+        prev_count=0
+    fi
+
+    local new_count=1
+    if [[ -n "$failure_class" && "$failure_class" == "$prev_class" ]]; then
+        new_count=$((prev_count + 1))
+    fi
+
+    local error_preview=""
+    error_preview=$(cat "$stderr_file" "$output_file" 2>/dev/null | tr '\n' ' ' | head -c 240 2>/dev/null || echo "")
+
+    local tmp_file="${FAILURE_STATE_FILE}.tmp"
+    jq -n \
+        --arg timestamp "$(get_iso_timestamp)" \
+        --arg last_failure_class "$failure_class" \
+        --argjson consecutive_same_class "$new_count" \
+        --argjson exit_code "$exit_code" \
+        --arg output_file "$output_file" \
+        --arg stderr_file "$stderr_file" \
+        --arg error_preview "$error_preview" \
+        '{
+            timestamp: $timestamp,
+            last_failure_class: $last_failure_class,
+            consecutive_same_class: $consecutive_same_class,
+            exit_code: $exit_code,
+            output_file: $output_file,
+            stderr_file: $stderr_file,
+            error_preview: $error_preview
+        }' > "$tmp_file" 2>/dev/null && mv "$tmp_file" "$FAILURE_STATE_FILE"
+}
+
+reset_failure_state() {
+    rm -f "$FAILURE_STATE_FILE" 2>/dev/null || true
 }
 
 # Check if we can make another call
@@ -843,6 +951,112 @@ calculate_wait_time() {
         log_status "WARN" "Could not parse reset time from error message, using 60-minute fallback" >&2
         echo "3600"
     fi
+}
+
+# Convert epoch seconds to ISO-8601 UTC (best-effort, cross-platform).
+# Returns empty string on failure.
+format_epoch_iso_utc() {
+    local epoch_seconds="$1"
+    if ! [[ "$epoch_seconds" =~ ^[0-9]+$ ]]; then
+        echo ""
+        return 0
+    fi
+
+    if date -u -r "$epoch_seconds" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null; then
+        return 0
+    fi
+    if date -u -d "@$epoch_seconds" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null; then
+        return 0
+    fi
+    if command -v gdate >/dev/null 2>&1; then
+        gdate -u -d "@$epoch_seconds" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo ""
+        return 0
+    fi
+
+    echo ""
+}
+
+# Parse provider reset hint from a rate-limit message.
+# Input format example: "You've hit your limit · resets 11pm (America/New_York)"
+# Output example: "11pm (America/New_York)" or "11:30pm (America/New_York)"
+extract_provider_rate_limit_reset_hint() {
+    local error_msg="$1"
+    local reset_regex='resets[[:space:]]([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*(am|pm)[[:space:]]*\(([^)]+)\)'
+
+    if [[ "$error_msg" =~ $reset_regex ]]; then
+        local hour="${BASH_REMATCH[1]}"
+        local minute="${BASH_REMATCH[3]:-}"
+        local ampm="${BASH_REMATCH[4]}"
+        local tz="${BASH_REMATCH[5]}"
+        tz="${tz//$'\r'/}"
+
+        if [[ -n "$minute" ]]; then
+            echo "${hour}:${minute}${ampm} (${tz})"
+        else
+            echo "${hour}${ampm} (${tz})"
+        fi
+        return 0
+    fi
+
+    echo ""
+}
+
+# Parse provider reset time from a rate-limit message into an ISO UTC timestamp.
+# Returns empty string if parsing/conversion fails.
+extract_provider_rate_limit_reset_at_iso_utc() {
+    local error_msg="$1"
+    local reset_regex='resets[[:space:]]([0-9]{1,2})(:([0-9]{2}))?[[:space:]]*(am|pm)[[:space:]]*\(([^)]+)\)'
+
+    if ! [[ "$error_msg" =~ $reset_regex ]]; then
+        echo ""
+        return 0
+    fi
+
+    local hour="${BASH_REMATCH[1]}"
+    local minute="${BASH_REMATCH[3]:-00}"
+    local ampm="${BASH_REMATCH[4]}"
+    local tz="${BASH_REMATCH[5]}"
+    tz="${tz//$'\r'/}"
+    hour=$((10#$hour))
+    minute=$((10#$minute))
+
+    # Convert to 24-hour format
+    if [[ "$ampm" == "pm" && "$hour" != "12" ]]; then
+        hour=$((hour + 12))
+    elif [[ "$ampm" == "am" && "$hour" == "12" ]]; then
+        hour=0
+    fi
+    printf -v hour "%02d" "$hour"
+    printf -v minute "%02d" "$minute"
+
+    local current_epoch reset_epoch date_str
+    current_epoch=$(TZ="$tz" date +%s 2>/dev/null || echo "")
+    date_str=$(TZ="$tz" date +%Y-%m-%d 2>/dev/null || echo "")
+    if [[ -z "$current_epoch" || -z "$date_str" ]]; then
+        echo ""
+        return 0
+    fi
+
+    reset_epoch=""
+    if reset_epoch=$(TZ="$tz" date -j -f "%Y-%m-%d %H:%M" "$date_str $hour:$minute" +%s 2>/dev/null); then
+        :
+    elif reset_epoch=$(TZ="$tz" date -d "$date_str $hour:$minute" +%s 2>/dev/null); then
+        :
+    elif command -v gdate >/dev/null 2>&1; then
+        reset_epoch=$(TZ="$tz" gdate -d "$date_str $hour:$minute" +%s 2>/dev/null || echo "")
+    fi
+
+    if ! [[ "$reset_epoch" =~ ^[0-9]+$ ]]; then
+        echo ""
+        return 0
+    fi
+
+    # If reset time is in the past (in that timezone), assume tomorrow.
+    if [[ "$reset_epoch" -le "$current_epoch" ]]; then
+        reset_epoch=$((reset_epoch + 86400))
+    fi
+
+    format_epoch_iso_utc "$reset_epoch"
 }
 
 # Get fix plan counts: total, completed, deferred, in_progress, open
@@ -1984,14 +2198,51 @@ execute_claude_code() {
             fi
         fi
 
-        # Get PID and monitor progress
-        local claude_pid=$!
-        local progress_counter=0
+	        # Get PID and monitor progress
+	        local claude_pid=$!
+	        local progress_counter=0
+	        local progress_poll_seconds="${RALPH_PROGRESS_POLL_SECONDS:-10}"
+	        if ! [[ "$progress_poll_seconds" =~ ^[0-9]+$ ]] || [[ "$progress_poll_seconds" -lt 1 ]]; then
+	            progress_poll_seconds=10
+	        fi
+	
+	        local effective_output_format="$CLAUDE_OUTPUT_FORMAT"
+	        if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+	            effective_output_format="stream-json"
+	        fi
 
-        # Show progress while Claude Code is running
-        while kill -0 $claude_pid 2>/dev/null; do
-            progress_counter=$((progress_counter + 1))
-            case $((progress_counter % 4)) in
+	        # Initialize progress telemetry immediately so monitors can parse progress.json
+	        # without waiting for the first polling tick.
+	        local progress_indicator="⠋"
+	        local initial_progress_tmp="${PROGRESS_FILE}.tmp"
+	        jq -n \
+	            --arg status "executing" \
+	            --arg indicator "$progress_indicator" \
+	            --argjson elapsed_seconds 0 \
+	            --arg output_format "$effective_output_format" \
+	            --arg last_output_preview "" \
+	            --arg timestamp "$(date '+%Y-%m-%d %H:%M:%S')" \
+	            --arg last_stream_record_type "" \
+	            --arg last_stream_event_type "" \
+	            --arg last_stream_session_id "" \
+	            '{
+	                status: $status,
+	                indicator: $indicator,
+	                elapsed_seconds: $elapsed_seconds,
+	                output_format: $output_format,
+	                last_output_preview: $last_output_preview,
+	                # Backwards compatible: some monitors may still read last_output
+	                last_output: $last_output_preview,
+	                last_stream_record_type: (if $last_stream_record_type == "" then null else $last_stream_record_type end),
+	                last_stream_event_type: (if $last_stream_event_type == "" then null else $last_stream_event_type end),
+	                last_stream_session_id: (if $last_stream_session_id == "" then null else $last_stream_session_id end),
+	                timestamp: $timestamp
+	            }' > "$initial_progress_tmp" 2>/dev/null && mv "$initial_progress_tmp" "$PROGRESS_FILE"
+
+	        # Show progress while Claude Code is running
+	        while kill -0 $claude_pid 2>/dev/null; do
+	            progress_counter=$((progress_counter + 1))
+	        case $((progress_counter % 4)) in
                 1) progress_indicator="⠋" ;;
                 2) progress_indicator="⠙" ;;
                 3) progress_indicator="⠹" ;;
@@ -1999,58 +2250,126 @@ execute_claude_code() {
             esac
 
             # Get last line from output if available
-            local last_line=""
-            if [[ -f "$output_file" && -s "$output_file" ]]; then
-                last_line=$(tail -1 "$output_file" 2>/dev/null | head -c 80)
+            local last_line_full=""
+            local last_output_preview=""
+            local last_stream_record_type=""
+            local last_stream_event_type=""
+            local last_stream_session_id=""
+	            if [[ -f "$output_file" && -s "$output_file" ]]; then
+	                last_line_full=$(tail -1 "$output_file" 2>/dev/null || echo "")
+	                last_output_preview=$(printf '%s' "$last_line_full" | head -c 160 2>/dev/null || echo "")
+	            fi
+
+            if [[ "$effective_output_format" == "stream-json" && -n "$last_line_full" ]]; then
+                last_stream_record_type=$(printf '%s' "$last_line_full" | jq -r '.type // empty' 2>/dev/null || echo "")
+                last_stream_event_type=$(printf '%s' "$last_line_full" | jq -r '.event.type // empty' 2>/dev/null || echo "")
+                last_stream_session_id=$(printf '%s' "$last_line_full" | jq -r '.session_id // .metadata.session_id // .sessionId // empty' 2>/dev/null || echo "")
             fi
 
-            # Update progress file for monitor
-            cat > "$PROGRESS_FILE" << EOF
-{
-    "status": "executing",
-    "indicator": "$progress_indicator",
-    "elapsed_seconds": $((progress_counter * 10)),
-    "last_output": "$last_line",
-    "timestamp": "$(date '+%Y-%m-%d %H:%M:%S')"
-}
-EOF
+            # Update progress file for monitor.
+            # Must remain valid JSON in stream-json mode (NDJSON last lines contain quotes/braces).
+	            local elapsed_seconds=$((progress_counter * progress_poll_seconds))
+	            local progress_tmp="${PROGRESS_FILE}.tmp"
+	            jq -n \
+	                --arg status "executing" \
+	                --arg indicator "$progress_indicator" \
+	                --argjson elapsed_seconds "$elapsed_seconds" \
+	                --arg output_format "$effective_output_format" \
+	                --arg last_output_preview "$last_output_preview" \
+	                --arg timestamp "$(date '+%Y-%m-%d %H:%M:%S')" \
+                --arg last_stream_record_type "$last_stream_record_type" \
+                --arg last_stream_event_type "$last_stream_event_type" \
+                --arg last_stream_session_id "$last_stream_session_id" \
+                '{
+                    status: $status,
+                    indicator: $indicator,
+                    elapsed_seconds: $elapsed_seconds,
+                    output_format: $output_format,
+                    last_output_preview: $last_output_preview,
+                    # Backwards compatible: some monitors may still read last_output
+                    last_output: $last_output_preview,
+                    last_stream_record_type: (if $last_stream_record_type == "" then null else $last_stream_record_type end),
+                    last_stream_event_type: (if $last_stream_event_type == "" then null else $last_stream_event_type end),
+                    last_stream_session_id: (if $last_stream_session_id == "" then null else $last_stream_session_id end),
+                    timestamp: $timestamp
+                }' > "$progress_tmp" 2>/dev/null && mv "$progress_tmp" "$PROGRESS_FILE"
 
-            # Only log if verbose mode is enabled
-            if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
-                if [[ -n "$last_line" ]]; then
-                    log_status "INFO" "$progress_indicator Claude Code: $last_line... (${progress_counter}0s)"
-                else
-                    log_status "INFO" "$progress_indicator Claude Code working... (${progress_counter}0s elapsed)"
-                fi
-            fi
+	            # Only log if verbose mode is enabled
+	            if [[ "$VERBOSE_PROGRESS" == "true" ]]; then
+	                if [[ -n "$last_output_preview" ]]; then
+	                    log_status "INFO" "$progress_indicator Claude Code: $last_output_preview... (${elapsed_seconds}s)"
+	                else
+	                    log_status "INFO" "$progress_indicator Claude Code working... (${elapsed_seconds}s elapsed)"
+	                fi
+	            fi
 
-            sleep 10
-        done
+	            sleep "$progress_poll_seconds"
+	        done
 
         # Wait for the process to finish and get exit code
         wait $claude_pid
         local exit_code=$?
 
-        # CP-016.26: Check for errors embedded in JSON response, even with non-zero exit codes
-        # Rate limit errors can come as {"is_error": true, "result": "You've hit your limit..."}
+        # CP-016.26 / CP-022: Check for errors embedded in JSON response, including stream-json (NDJSON).
+        # Rate limit errors can come as:
+        #   - json:        {"is_error": true, "result": "You've hit your limit..."}
+        #   - stream-json: many JSON records, with a final {"type":"result", "is_error": true, "result": "..."}
         local rate_limit_detected="false"
         local json_error_file="$output_file"
+
+        local effective_output_format="$CLAUDE_OUTPUT_FORMAT"
+        if [[ "$CODEX_REVIEW_ONLY" == "true" ]]; then
+            effective_output_format="stream-json"
+        fi
+
         if ! jq empty "$json_error_file" >/dev/null 2>&1; then
             if [[ -s "$stderr_file" ]] && jq empty "$stderr_file" >/dev/null 2>&1; then
                 json_error_file="$stderr_file"
             fi
         fi
-        if jq -e '.is_error == true' "$json_error_file" >/dev/null 2>&1; then
-            local error_msg
-            error_msg=$(jq -r '.result // "Unknown error"' "$json_error_file" 2>/dev/null)
+
+        local error_msg=""
+        local is_error="false"
+        if [[ -f "$json_error_file" && -s "$json_error_file" ]]; then
+            if [[ "$effective_output_format" == "stream-json" ]]; then
+                # NDJSON: isolate the final result record so we don't emit per-record fallbacks (e.g., "Unknown error").
+                local result_obj=""
+                result_obj=$(jq -c 'select(.type == "result")' "$json_error_file" 2>/dev/null | tail -n 1 || true)
+                if [[ -n "$result_obj" ]]; then
+                    if echo "$result_obj" | jq -e '.is_error == true' >/dev/null 2>&1; then
+                        is_error="true"
+                        error_msg=$(echo "$result_obj" | jq -r '.result // empty' 2>/dev/null || echo "")
+                    fi
+                fi
+            else
+                if jq -e '.is_error == true' "$json_error_file" >/dev/null 2>&1; then
+                    is_error="true"
+                    error_msg=$(jq -r '.result // empty' "$json_error_file" 2>/dev/null || echo "")
+                fi
+            fi
+        fi
+
+        if [[ "$is_error" == "true" ]]; then
             if [[ "$error_msg" == *"limit"* ]] || [[ "$error_msg" == *"resets"* ]]; then
-                log_status "ERROR" "API rate limit detected in JSON response: $error_msg"
-                # Store error message for wait time calculation
-                echo "$error_msg" > "$STATE_DIR/.rate_limit_error"
+                # Store error message for wait time calculation + operator visibility.
+                printf '%s\n' "$error_msg" > "$STATE_DIR/.rate_limit_error"
+                local provider_hint=""
+                provider_hint=$(extract_provider_rate_limit_reset_hint "$error_msg")
+                local provider_reset_at=""
+                provider_reset_at=$(extract_provider_rate_limit_reset_at_iso_utc "$error_msg")
+                printf '%s\n' "$provider_hint" > "$STATE_DIR/.rate_limit_reset_hint"
+                printf '%s\n' "$provider_reset_at" > "$STATE_DIR/.rate_limit_reset_at"
+
+                local error_preview=""
+                error_preview=$(printf '%s' "$error_msg" | tr '\n' ' ' | head -c 220 2>/dev/null || echo "")
+                log_status "ERROR" "API rate limit detected in JSON response: $error_preview"
+
                 rate_limit_detected="true"
                 exit_code=2  # Treat as rate limit error
             else
-                log_status "ERROR" "Claude returned error: $error_msg"
+                local error_preview=""
+                error_preview=$(printf '%s' "$error_msg" | tr '\n' ' ' | head -c 220 2>/dev/null || echo "")
+                log_status "ERROR" "Claude returned error: $error_preview"
                 if [ $exit_code -eq 0 ]; then
                     exit_code=1
                 fi
@@ -2058,8 +2377,12 @@ EOF
         fi
 
 	        if [ $exit_code -ne 0 ]; then
-	            # Clear progress file on failure
-	            echo '{"status": "failed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
+	            # Clear progress file on failure (must remain valid JSON)
+	            local progress_tmp="${PROGRESS_FILE}.tmp"
+	            jq -n \
+	                --arg status "failed" \
+	                --arg timestamp "$(date '+%Y-%m-%d %H:%M:%S')" \
+	                '{status: $status, timestamp: $timestamp}' > "$progress_tmp" 2>/dev/null && mv "$progress_tmp" "$PROGRESS_FILE"
 	
 	            # Detect timeout exit codes for clearer diagnosis.
 	            if [[ $exit_code -eq 124 ]]; then
@@ -2072,14 +2395,19 @@ EOF
 	                return 2  # Special return code for API limit
             fi
 
-	            if [[ -s "$stderr_file" ]]; then
-	                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file (stderr: $stderr_file)"
-	            else
-	                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
-	            fi
-	
-	            # Feed failures into the circuit breaker to avoid infinite retry loops when
-	            # Claude can't produce output (e.g., repeated timeouts or permission deadlocks).
+		            if [[ -s "$stderr_file" ]]; then
+		                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file (stderr: $stderr_file)"
+		            else
+		                log_status "ERROR" "❌ Claude Code execution failed, check: $output_file"
+		            fi
+
+		            # CP-022: classify and persist failure state for failure-class-aware stop/backoff.
+		            local failure_class=""
+		            failure_class=$(detect_failure_class "$exit_code" "$output_file" "$stderr_file")
+		            update_failure_state "$failure_class" "$exit_code" "$output_file" "$stderr_file"
+		
+		            # Feed failures into the circuit breaker to avoid infinite retry loops when
+		            # Claude can't produce output (e.g., repeated timeouts or permission deadlocks).
 	            local files_changed
 	            files_changed=$(git diff --name-only HEAD 2>/dev/null | wc -l || echo 0)
 	            local progress_signature
@@ -2107,9 +2435,14 @@ EOF
 	        echo "$calls_made" > "$CALL_COUNT_FILE"
 
         # Clear progress file
-        echo '{"status": "completed", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE"
+        local progress_tmp="${PROGRESS_FILE}.tmp"
+        jq -n \
+            --arg status "completed" \
+            --arg timestamp "$(date '+%Y-%m-%d %H:%M:%S')" \
+            '{status: $status, timestamp: $timestamp}' > "$progress_tmp" 2>/dev/null && mv "$progress_tmp" "$PROGRESS_FILE"
 
-        log_status "SUCCESS" "✅ Claude Code execution completed successfully"
+	        log_status "SUCCESS" "✅ Claude Code execution completed successfully"
+	        reset_failure_state
 
         # Save session ID from JSON output (Phase 1.1)
         if [[ "$CLAUDE_USE_CONTINUE" == "true" ]]; then
@@ -2302,7 +2635,11 @@ cleanup_on_exit() {
 	    if [[ "$last_action" != "graceful_exit" ]]; then
 	        reset_session "manual_interrupt"
 	        update_status "$loop_count" "$(cat "$CALL_COUNT_FILE" 2>/dev/null || echo "0")" "interrupted" "stopped" "signal_interrupt"
-	        echo '{"status": "stopped", "timestamp": "'$(date '+%Y-%m-%d %H:%M:%S')'"}' > "$PROGRESS_FILE" 2>/dev/null || true
+	        local progress_tmp="${PROGRESS_FILE}.tmp"
+	        jq -n \
+	            --arg status "stopped" \
+	            --arg timestamp "$(date '+%Y-%m-%d %H:%M:%S')" \
+	            '{status: $status, timestamp: $timestamp}' > "$progress_tmp" 2>/dev/null && mv "$progress_tmp" "$PROGRESS_FILE"
 	    fi
 	    exit 0
 	}
@@ -2418,10 +2755,12 @@ main() {
             loop_count=$(loop_count_pre_increment_for_resume "$saved_loop_count")  # Resume at saved loop number
         fi
 
-        # Clean up recovery state file
-        rm -f "$STATE_DIR/.rate_limit_loop"
-        rm -f "$STATE_DIR/.rate_limit_error"
-    fi
+	        # Clean up recovery state file
+	        rm -f "$STATE_DIR/.rate_limit_loop"
+	        rm -f "$STATE_DIR/.rate_limit_error"
+	        rm -f "$STATE_DIR/.rate_limit_reset_hint"
+	        rm -f "$STATE_DIR/.rate_limit_reset_at"
+	    fi
 
     log_status "INFO" "Starting main loop..."
     log_status "INFO" "DEBUG: About to enter while loop, loop_count=$loop_count"
@@ -2498,7 +2837,16 @@ main() {
             break
         elif [ $exec_result -eq 2 ]; then
             # API 5-hour limit reached - handle specially
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused" "rate_limited"
+            reset_failure_state
+            local provider_hint=""
+            local provider_reset_at=""
+            if [[ -f "$STATE_DIR/.rate_limit_reset_hint" ]]; then
+                provider_hint=$(cat "$STATE_DIR/.rate_limit_reset_hint" 2>/dev/null || echo "")
+            fi
+            if [[ -f "$STATE_DIR/.rate_limit_reset_at" ]]; then
+                provider_reset_at=$(cat "$STATE_DIR/.rate_limit_reset_at" 2>/dev/null || echo "")
+            fi
+            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit" "paused" "rate_limited" "$provider_hint" "$provider_reset_at"
             log_status "WARN" "🛑 Claude API 5-hour limit reached!"
 
             # CP-016.26: Autonomous mode - auto-wait without user interaction
@@ -2535,6 +2883,8 @@ main() {
                 # Clean up state file
                 rm -f "$STATE_DIR/.rate_limit_loop"
                 rm -f "$STATE_DIR/.rate_limit_error"
+                rm -f "$STATE_DIR/.rate_limit_reset_hint"
+                rm -f "$STATE_DIR/.rate_limit_reset_at"
 
                 log_status "SUCCESS" "[AUTONOMOUS] Rate limit wait complete, resuming loop..."
                 update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "executing" "running" "resumed_after_rate_limit"
@@ -2556,7 +2906,7 @@ main() {
 
                 if [[ "$user_choice" == "2" ]] || [[ -z "$user_choice" ]]; then
                     log_status "INFO" "User chose to exit (or timed out). Exiting loop..."
-                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit"
+                    update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "api_limit_exit" "stopped" "api_5hour_limit" "$provider_hint" "$provider_reset_at"
                     break
                 else
                     log_status "INFO" "User chose to wait. Waiting for API limit reset..."
@@ -2580,11 +2930,54 @@ main() {
                     continue
                 fi
             fi
-        else
-            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error"
-            log_status "WARN" "Execution failed, waiting ${RETRY_SLEEP_SECONDS}s before retry..."
-            sleep "$RETRY_SLEEP_SECONDS"
-        fi
+	        else
+	            local failure_class="unknown_failure"
+	            local consecutive_same_class=1
+	            local error_preview=""
+	            if [[ -f "$FAILURE_STATE_FILE" ]]; then
+	                failure_class=$(jq -r '.last_failure_class // "unknown_failure"' "$FAILURE_STATE_FILE" 2>/dev/null || echo "unknown_failure")
+	                consecutive_same_class=$(jq -r '.consecutive_same_class // 1' "$FAILURE_STATE_FILE" 2>/dev/null || echo "1")
+	                error_preview=$(jq -r '.error_preview // ""' "$FAILURE_STATE_FILE" 2>/dev/null || echo "")
+	            fi
+	            if ! [[ "$consecutive_same_class" =~ ^[0-9]+$ ]]; then
+	                consecutive_same_class=1
+	            fi
+	
+	            local backoff_seconds="$RETRY_SLEEP_SECONDS"
+	            if [[ "$consecutive_same_class" -gt 1 ]]; then
+	                backoff_seconds=$((RETRY_SLEEP_SECONDS * consecutive_same_class))
+	            fi
+	            # Cap backoff so we don't sleep arbitrarily long without changing conditions.
+	            if [[ "$backoff_seconds" -gt 300 ]]; then
+	                backoff_seconds=300
+	            fi
+	
+	            local should_stop="false"
+	            case "$failure_class" in
+	                auth_or_config)
+	                    should_stop="true"
+	                    ;;
+	                claude_outer_timeout|mcp_tool_timeout|mcp_thread_not_found)
+	                    if [[ "$consecutive_same_class" -ge 2 ]]; then
+	                        should_stop="true"
+	                    fi
+	                    ;;
+	            esac
+	
+	            if [[ "$should_stop" == "true" ]]; then
+	                update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "failed" "$failure_class"
+	                log_status "ERROR" "🛑 Stopping: repeated failure class '$failure_class' (count=$consecutive_same_class)."
+	                if [[ -n "$error_preview" ]]; then
+	                    log_status "ERROR" "Last error preview: $error_preview"
+	                fi
+	                main_exit_code=1
+	                break
+	            fi
+	
+	            update_status "$loop_count" "$(cat "$CALL_COUNT_FILE")" "failed" "error" "$failure_class"
+	            log_status "WARN" "Execution failed (class=$failure_class, count=$consecutive_same_class). Waiting ${backoff_seconds}s before retry..."
+	            sleep "$backoff_seconds"
+	        fi
         
         log_status "LOOP" "=== Completed Loop #$loop_count ==="
     done
@@ -2618,10 +3011,11 @@ Modern CLI Options (Phase 1.1):
     --output-format FORMAT  Set Claude output format: json, stream-json, or text (default: $CLAUDE_OUTPUT_FORMAT)
     --allowed-tools TOOLS   Comma-separated list of allowed tools (default: $CLAUDE_ALLOWED_TOOLS)
                             Supports scoped tokens: Read(<glob>), Write(<glob>), Edit(<glob>)
-    --permission-mode MODE  Set Claude CLI permission mode (default: unset)
-    --review-only           Restrict tools to Codex MCP only for this run
-    --no-continue           Disable session continuity across loops
-    --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
+	    --permission-mode MODE  Set Claude CLI permission mode (default: unset)
+	    --review-only           Restrict tools to Codex MCP only for this run
+	    --continue              Enable session continuity across loops (opt-in)
+	    --no-continue           Disable session continuity across loops
+	    --session-expiry HOURS  Set session expiration time in hours (default: $CLAUDE_SESSION_EXPIRY_HOURS)
 
 Codex Context Options:
     --codex-context FILE    Path to file list for Codex context bundle (optional)
@@ -2657,10 +3051,11 @@ Examples:
     $0 --monitor             # Start with integrated tmux monitoring
     $0 --monitor --timeout 30   # 30-minute timeout for complex tasks
     $0 --verbose --timeout 5    # 5-minute timeout with detailed progress
-    $0 --output-format text     # Use legacy text output format
-    $0 --no-continue            # Disable session continuity
-    $0 --session-expiry 48      # 48-hour session expiration
-    $0 --no-focus-fix-plan      # Disable fix plan focus injection
+	    $0 --output-format text     # Use legacy text output format
+	    $0 --continue               # Enable session continuity
+	    $0 --no-continue            # Disable session continuity
+	    $0 --session-expiry 48      # 48-hour session expiration
+	    $0 --no-focus-fix-plan      # Disable fix plan focus injection
 
 HELPEOF
 }
@@ -2790,18 +3185,22 @@ HELPEOF
             CODEX_CONTEXT_MAX_CHARS="$2"
             shift 2
             ;;
-        --codex-context-total-chars)
+	        --codex-context-total-chars)
             if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
                 echo "Error: --codex-context-total-chars requires a positive integer"
                 exit 1
             fi
-            CODEX_CONTEXT_TOTAL_MAX_CHARS="$2"
-            shift 2
-            ;;
-        --no-continue)
-            CLAUDE_USE_CONTINUE=false
-            shift
-            ;;
+	            CODEX_CONTEXT_TOTAL_MAX_CHARS="$2"
+	            shift 2
+	            ;;
+	        --continue)
+	            CLAUDE_USE_CONTINUE=true
+	            shift
+	            ;;
+	        --no-continue)
+	            CLAUDE_USE_CONTINUE=false
+	            shift
+	            ;;
         --session-expiry)
             if [[ -z "$2" || ! "$2" =~ ^[1-9][0-9]*$ ]]; then
                 echo "Error: --session-expiry requires a positive integer (hours)"

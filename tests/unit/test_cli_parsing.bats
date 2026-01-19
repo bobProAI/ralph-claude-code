@@ -86,6 +86,7 @@ teardown() {
     [[ "$output" == *"--circuit-status"* ]]
     [[ "$output" == *"--output-format"* ]]
     [[ "$output" == *"--allowed-tools"* ]]
+    [[ "$output" == *"--continue"* ]]
     [[ "$output" == *"--no-continue"* ]]
 }
 
@@ -245,7 +246,7 @@ EOF
     run bash "$RALPH_SCRIPT" --output-format invalid
 
     assert_failure
-    [[ "$output" == *"must be 'json' or 'text'"* ]]
+    [[ "$output" == *"must be 'json', 'stream-json', or 'text'"* ]]
 }
 
 @test "--allowed-tools flag accepts valid tool list" {
