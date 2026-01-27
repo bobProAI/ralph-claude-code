@@ -440,12 +440,12 @@ CB_OUTPUT_DECLINE_THRESHOLD=70   # Open circuit if output declines by >70%
 
 **Completion Indicators with EXIT_SIGNAL Gate:**
 
-| completion_indicators | EXIT_SIGNAL | Result |
-|-----------------------|-------------|--------|
-| >= 2 | `true` | **Exit** ("project_complete") |
-| >= 2 | `false` | **Continue** (Claude still working) |
-| >= 2 | missing | **Continue** (defaults to false) |
-| < 2 | `true` | **Continue** (threshold not met) |
+| completion_indicators | EXIT_SIGNAL | Result                              |
+| --------------------- | ----------- | ----------------------------------- |
+| >= 2                  | `true`      | **Exit** ("project_complete")       |
+| >= 2                  | `false`     | **Continue** (Claude still working) |
+| >= 2                  | missing     | **Continue** (defaults to false)    |
+| < 2                   | `true`      | **Continue** (threshold not met)    |
 
 ## Project Structure
 
@@ -807,11 +807,11 @@ The `run.sh` wrapper:
 
 This branch includes patches documented in [PATCHES.md](PATCHES.md):
 
-| Patch | Flag | Purpose |
-|-------|------|---------|
-| State directory | `--state-dir DIR` | Relocate all state under configurable directory |
-| Fix plan path | `--fix-plan FILE` | Configurable fix plan location |
-| Tool scoping | `--allowed-tools` | Support `Write(<glob>)`, `Edit(<glob>)` patterns |
+| Patch           | Flag              | Purpose                                          |
+| --------------- | ----------------- | ------------------------------------------------ |
+| State directory | `--state-dir DIR` | Relocate all state under configurable directory  |
+| Fix plan path   | `--fix-plan FILE` | Configurable fix plan location                   |
+| Tool scoping    | `--allowed-tools` | Support `Write(<glob>)`, `Edit(<glob>)` patterns |
 
 ### AI Toolkit Integration
 

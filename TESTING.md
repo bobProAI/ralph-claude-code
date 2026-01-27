@@ -43,6 +43,7 @@ npm install
 ```
 
 This installs:
+
 - **bats** (v1.12.0) - Bash Automated Testing System
 - **bats-assert** - Assertion library
 - **bats-support** - Support functions
@@ -120,11 +121,11 @@ tests/
 
 ### Test Categories
 
-| Category | Purpose | Execution Speed | Dependencies |
-|----------|---------|-----------------|--------------|
-| **Unit** | Test individual functions in isolation | Fast (<1s per file) | None (uses mocks) |
-| **Integration** | Test component interactions | Medium (1-5s per file) | Real git, filesystem |
-| **E2E** | Test complete workflows | Slow (>5s per file) | Full environment |
+| Category        | Purpose                                | Execution Speed        | Dependencies         |
+| --------------- | -------------------------------------- | ---------------------- | -------------------- |
+| **Unit**        | Test individual functions in isolation | Fast (<1s per file)    | None (uses mocks)    |
+| **Integration** | Test component interactions            | Medium (1-5s per file) | Real git, filesystem |
+| **E2E**         | Test complete workflows                | Slow (>5s per file)    | Full environment     |
 
 ### Naming Conventions
 
@@ -343,6 +344,7 @@ teardown() {
 ### Best Practices
 
 1. **Test One Thing**: Each test should verify a single behavior
+
    ```bash
    # Good: focused test
    @test "increment counter increases value by 1" { ... }
@@ -352,6 +354,7 @@ teardown() {
    ```
 
 2. **Descriptive Names**: Tests should read as documentation
+
    ```bash
    # Good: clear intent
    @test "can_make_call returns failure when at limit"
@@ -361,6 +364,7 @@ teardown() {
    ```
 
 3. **Isolate Tests**: Each test should set up its own state
+
    ```bash
    setup() {
        export TEST_TEMP_DIR="$(mktemp -d)"  # Fresh directory each test
@@ -369,6 +373,7 @@ teardown() {
    ```
 
 4. **Clean Up**: Always restore state in teardown
+
    ```bash
    teardown() {
        teardown_mocks  # Restore mocked commands
@@ -378,6 +383,7 @@ teardown() {
    ```
 
 5. **Use Helpers**: Don't duplicate setup/assertion code
+
    ```bash
    # Good: use provided helpers
    assert_file_exists "output.txt"
@@ -541,10 +547,10 @@ create_sample_progress_executing "progress.json"
 
 ### Quality Gates
 
-| Metric | Requirement | Enforcement |
-|--------|-------------|-------------|
-| **Test Pass Rate** | 100% | **Blocking** - CI fails on any test failure |
-| **Coverage Target** | 85%+ | Informational only |
+| Metric              | Requirement | Enforcement                                 |
+| ------------------- | ----------- | ------------------------------------------- |
+| **Test Pass Rate**  | 100%        | **Blocking** - CI fails on any test failure |
+| **Coverage Target** | 85%+        | Informational only                          |
 
 ### Why Coverage Is Informational
 
@@ -625,11 +631,11 @@ test:
     - uses: actions/checkout@v3
     - uses: actions/setup-node@v3
       with:
-        node-version: '18'
+        node-version: "18"
     - run: npm install && sudo apt-get install -y jq
-    - run: npm run test:unit          # Must pass
-    - run: npm run test:integration   # Allowed to fail (|| true)
-    - run: npm run test:e2e          # Allowed to fail (|| true)
+    - run: npm run test:unit # Must pass
+    - run: npm run test:integration # Allowed to fail (|| true)
+    - run: npm run test:e2e # Allowed to fail (|| true)
 ```
 
 #### 2. Coverage Job (Informational)
@@ -637,9 +643,9 @@ test:
 ```yaml
 coverage:
   runs-on: ubuntu-latest
-  needs: test  # Only runs after test passes
+  needs: test # Only runs after test passes
   env:
-    COVERAGE_THRESHOLD: 0  # Disabled
+    COVERAGE_THRESHOLD: 0 # Disabled
 ```
 
 ### Viewing CI Results
@@ -651,13 +657,13 @@ coverage:
 
 ### Local vs CI Differences
 
-| Aspect | Local | CI |
-|--------|-------|-----|
-| Environment | Your machine | ubuntu-latest container |
-| Node version | Your installed version | v18 (specified) |
-| Dependencies | Cached | Fresh install |
-| Coverage | Optional | Automatic |
-| Artifacts | Manual | Auto-uploaded |
+| Aspect       | Local                  | CI                      |
+| ------------ | ---------------------- | ----------------------- |
+| Environment  | Your machine           | ubuntu-latest container |
+| Node version | Your installed version | v18 (specified)         |
+| Dependencies | Cached                 | Fresh install           |
+| Coverage     | Optional               | Automatic               |
+| Artifacts    | Manual                 | Auto-uploaded           |
 
 ### Reproducing CI Failures
 
@@ -713,11 +719,13 @@ not ok 3 - can_make_call returns success when under limit
 #### Debugging Steps
 
 1. **Run single test**:
+
    ```bash
    bats tests/unit/test_rate_limiting.bats --filter "can_make_call"
    ```
 
 2. **Add debug output**:
+
    ```bash
    @test "debugging example" {
        echo "Before command" >&3  # Print to stdout during test
@@ -732,6 +740,7 @@ not ok 3 - can_make_call returns success when under limit
    ```
 
 3. **Use set -x for tracing**:
+
    ```bash
    @test "trace example" {
        set -x  # Enable bash tracing
@@ -847,6 +856,7 @@ export BATS_TEST_TMPDIR="${TMPDIR:-/tmp}/bats-ralph-$$"
 #### Tests Pass Locally, Fail in CI
 
 1. **Check environment differences**:
+
    ```bash
    # CI uses ubuntu-latest
    uname -a
@@ -854,6 +864,7 @@ export BATS_TEST_TMPDIR="${TMPDIR:-/tmp}/bats-ralph-$$"
    ```
 
 2. **Check for hardcoded paths**:
+
    ```bash
    # Bad: hardcoded path
    source "/home/user/ralph/lib/utils.sh"
@@ -985,12 +996,14 @@ run command arg1 arg2
 #### Adding New Test Files
 
 1. Create file in appropriate directory:
+
    ```bash
    touch tests/unit/test_my_feature.bats
    chmod +x tests/unit/test_my_feature.bats
    ```
 
 2. Use standard header:
+
    ```bash
    #!/usr/bin/env bats
    # Unit tests for my feature
@@ -999,6 +1012,7 @@ run command arg1 arg2
    ```
 
 3. Verify tests run:
+
    ```bash
    bats tests/unit/test_my_feature.bats
    ```

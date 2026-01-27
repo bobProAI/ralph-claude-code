@@ -90,13 +90,13 @@ ralph-claude-code/
 
 Always create a feature branch - never work directly on `main`:
 
-| Branch Type | Format | Example |
-|-------------|--------|---------|
-| New features | `feature/<feature-name>` | `feature/log-rotation` |
-| Bug fixes | `fix/<issue-name>` | `fix/rate-limit-reset` |
-| Documentation | `docs/<doc-update>` | `docs/api-reference` |
-| Tests | `test/<test-area>` | `test/circuit-breaker` |
-| Refactoring | `refactor/<area>` | `refactor/response-analyzer` |
+| Branch Type   | Format                   | Example                      |
+| ------------- | ------------------------ | ---------------------------- |
+| New features  | `feature/<feature-name>` | `feature/log-rotation`       |
+| Bug fixes     | `fix/<issue-name>`       | `fix/rate-limit-reset`       |
+| Documentation | `docs/<doc-update>`      | `docs/api-reference`         |
+| Tests         | `test/<test-area>`       | `test/circuit-breaker`       |
+| Refactoring   | `refactor/<area>`        | `refactor/response-analyzer` |
 
 ```bash
 # Create a new feature branch
@@ -117,14 +117,14 @@ We use [Conventional Commits](https://www.conventionalcommits.org/) for clear, s
 
 **Types:**
 
-| Type | Description | Example |
-|------|-------------|---------|
-| `feat` | New feature | `feat(loop): add dry-run mode` |
-| `fix` | Bug fix | `fix(monitor): correct refresh rate` |
-| `docs` | Documentation only | `docs(readme): update installation steps` |
-| `test` | Adding/updating tests | `test(setup): add template validation tests` |
+| Type       | Description                     | Example                                        |
+| ---------- | ------------------------------- | ---------------------------------------------- |
+| `feat`     | New feature                     | `feat(loop): add dry-run mode`                 |
+| `fix`      | Bug fix                         | `fix(monitor): correct refresh rate`           |
+| `docs`     | Documentation only              | `docs(readme): update installation steps`      |
+| `test`     | Adding/updating tests           | `test(setup): add template validation tests`   |
 | `refactor` | Code change (no features/fixes) | `refactor(analyzer): simplify error detection` |
-| `chore` | Maintenance tasks | `chore(deps): update bats-assert` |
+| `chore`    | Maintenance tasks               | `chore(deps): update bats-assert`              |
 
 **Examples from Recent Commits:**
 
@@ -225,13 +225,13 @@ fi
 
 **Naming Conventions:**
 
-| Element | Convention | Example |
-|---------|------------|---------|
-| Functions | snake_case | `get_circuit_state()` |
-| Local variables | snake_case | `local loop_count=0` |
-| Constants | UPPER_SNAKE_CASE | `MAX_CALLS_PER_HOUR` |
-| File names | snake_case.sh | `circuit_breaker.sh` |
-| Control files | @prefix | `@fix_plan.md` |
+| Element         | Convention       | Example               |
+| --------------- | ---------------- | --------------------- |
+| Functions       | snake_case       | `get_circuit_state()` |
+| Local variables | snake_case       | `local loop_count=0`  |
+| Constants       | UPPER_SNAKE_CASE | `MAX_CALLS_PER_HOUR`  |
+| File names      | snake_case.sh    | `circuit_breaker.sh`  |
+| Control files   | @prefix          | `@fix_plan.md`        |
 
 **Function Documentation:**
 
@@ -294,10 +294,10 @@ local state=$(jq -r '.state' "$STATE_FILE" 2>/dev/null || echo "CLOSED")
 
 **All new features must include tests. This is non-negotiable.**
 
-| Requirement | Standard | Enforcement |
-|-------------|----------|-------------|
-| Test Pass Rate | 100% | **Mandatory** - CI blocks merge |
-| Test Coverage | 85% | Aspirational - informational only |
+| Requirement    | Standard | Enforcement                       |
+| -------------- | -------- | --------------------------------- |
+| Test Pass Rate | 100%     | **Mandatory** - CI blocks merge   |
+| Test Coverage  | 85%      | Aspirational - informational only |
 
 > **Note on Coverage:** Bash code coverage with kcov cannot trace subprocess executions. Test pass rate is the enforced quality gate, not coverage percentage.
 
@@ -325,12 +325,12 @@ tests/
 
 ### Running Tests
 
-| Command | Purpose | When to Use |
-|---------|---------|-------------|
-| `npm test` | Run all tests | Before committing, before PR |
-| `npm run test:unit` | Unit tests only | During development |
-| `npm run test:integration` | Integration tests only | Testing interactions |
-| `bats tests/unit/test_file.bats` | Single test file | Debugging specific tests |
+| Command                          | Purpose                | When to Use                  |
+| -------------------------------- | ---------------------- | ---------------------------- |
+| `npm test`                       | Run all tests          | Before committing, before PR |
+| `npm run test:unit`              | Unit tests only        | During development           |
+| `npm run test:integration`       | Integration tests only | Testing interactions         |
+| `bats tests/unit/test_file.bats` | Single test file       | Debugging specific tests     |
 
 ### Writing Tests
 
@@ -423,6 +423,7 @@ Run through this checklist:
 ### Creating the PR
 
 1. **Push your branch:**
+
    ```bash
    git push origin feature/my-feature
    ```
@@ -430,11 +431,13 @@ Run through this checklist:
 2. **Open a Pull Request** on GitHub with:
 
 **PR Title:** Follow conventional commit format
+
 ```
 feat(loop): add dry-run mode for testing
 ```
 
 **PR Description Template:**
+
 ```markdown
 ## Summary
 
@@ -495,14 +498,14 @@ Related to #456
 
 **What to Check:**
 
-| Area | Questions to Ask |
-|------|------------------|
-| **Correctness** | Does the code do what it claims? |
-| **Tests** | Are tests comprehensive? Do they pass? |
-| **Style** | Does it follow bash conventions? |
-| **Documentation** | Are comments and docs updated? |
-| **Breaking Changes** | Will this affect existing users? |
-| **Performance** | Any obvious performance issues? |
+| Area                 | Questions to Ask                       |
+| -------------------- | -------------------------------------- |
+| **Correctness**      | Does the code do what it claims?       |
+| **Tests**            | Are tests comprehensive? Do they pass? |
+| **Style**            | Does it follow bash conventions?       |
+| **Documentation**    | Are comments and docs updated?         |
+| **Breaking Changes** | Will this affect existing users?       |
+| **Performance**      | Any obvious performance issues?        |
 
 **Review Best Practices:**
 
@@ -520,13 +523,13 @@ Related to #456
 
 All PRs must pass these automated checks:
 
-| Gate | Requirement | Enforcement |
-|------|-------------|-------------|
-| Unit Tests | 100% pass | **Blocks merge** |
-| Integration Tests | 100% pass | **Blocks merge** |
-| Coverage | 85% | Informational only |
-| Conventional Commits | Required | Manual review |
-| Documentation | Updated | Manual review |
+| Gate                 | Requirement | Enforcement        |
+| -------------------- | ----------- | ------------------ |
+| Unit Tests           | 100% pass   | **Blocks merge**   |
+| Integration Tests    | 100% pass   | **Blocks merge**   |
+| Coverage             | 85%         | Informational only |
+| Conventional Commits | Required    | Manual review      |
+| Documentation        | Updated     | Manual review      |
 
 ### Documentation Standards
 

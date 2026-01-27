@@ -55,6 +55,7 @@ The system uses a modular architecture with reusable components in the `lib/` di
 ## Key Commands
 
 ### Installation
+
 ```bash
 # Install Ralph globally (run once)
 ./install.sh
@@ -64,6 +65,7 @@ The system uses a modular architecture with reusable components in the `lib/` di
 ```
 
 ### Setting Up a New Project
+
 ```bash
 # Create a new Ralph-managed project (run from anywhere)
 ralph-setup my-project-name
@@ -71,6 +73,7 @@ cd my-project-name
 ```
 
 ### Running the Ralph Loop
+
 ```bash
 # Start with integrated tmux monitoring (recommended)
 ralph --monitor
@@ -93,6 +96,7 @@ ralph --reset-session    # Reset session state manually
 ```
 
 ### Monitoring
+
 ```bash
 # Integrated tmux monitoring (recommended)
 ralph --monitor
@@ -106,6 +110,7 @@ tmux attach -t <session-name>
 ```
 
 ### Running Tests
+
 ```bash
 # Run all tests (165 tests)
 npm test
@@ -133,6 +138,7 @@ The loop is controlled by several key files and environment variables:
 Ralph supports monorepo-safe state isolation via `--state-dir DIR` (default: `.`). When set, all loop state (status/progress/logs/session files/exit signals/analysis artifacts) is written under that directory.
 
 ### Rate Limiting
+
 - Default: 100 API calls per hour (configurable via `--calls` flag)
 - Automatic hourly reset with countdown display
 - Call tracking persists across script restarts
@@ -142,6 +148,7 @@ Ralph supports monorepo-safe state isolation via `--state-dir DIR` (default: `.`
 Ralph uses modern Claude Code CLI flags for structured communication:
 
 **Configuration Variables:**
+
 ```bash
 CLAUDE_OUTPUT_FORMAT="json"           # Output format: json (default) or text
 CLAUDE_ALLOWED_TOOLS="Read,Write,Bash(git *),Bash(pnpm *)"  # Allowed tool permissions
@@ -150,37 +157,44 @@ CLAUDE_MIN_VERSION="2.0.76"           # Minimum Claude CLI version
 ```
 
 **CLI Options:**
+
 - `--output-format json|text` - Set Claude output format (default: json)
 - `--allowed-tools "Read,Write,Bash(git *),Bash(pnpm *)"` - Restrict allowed tools
 - `--no-continue` - Disable session continuity, start fresh each loop
 
 **Loop Context:**
 Each loop iteration injects context via `build_loop_context()`:
+
 - Current loop number
 - Remaining tasks from @fix_plan.md
 - Circuit breaker state (if not CLOSED)
 - Previous loop work summary
 
 **Session Continuity:**
+
 - Sessions are preserved in `.claude_session_id` (in the state dir)
 - Use `--continue` flag to maintain context across loops
 - Disable with `--no-continue` for isolated iterations
 
 ### Intelligent Exit Detection
+
 The loop uses a dual-condition check to prevent premature exits during productive iterations:
 
 **Exit requires BOTH conditions:**
+
 1. `recent_completion_indicators >= 2` (heuristic-based detection from natural language patterns)
 2. Claude's explicit `EXIT_SIGNAL: true` in the RALPH_STATUS block
 
 The `EXIT_SIGNAL` value is read from `$STATE_DIR/.response_analysis` (default: `.response_analysis`, at `.analysis.exit_signal`) which is populated by `response_analyzer.sh` from Claude's RALPH_STATUS output block.
 
 **Other exit conditions (checked before completion indicators):**
+
 - Multiple consecutive "done" signals from Claude Code (`done_signals >= 2`)
 - Too many test-only loops indicating feature completeness (`test_loops >= 3`)
 - All items in @fix_plan.md marked as completed
 
 **Example behavior when EXIT_SIGNAL is false:**
+
 ```
 Loop 5: Claude outputs "Phase complete, moving to next feature"
         → completion_indicators: 3 (high confidence from patterns)
@@ -214,11 +228,13 @@ Ralph uses GitHub Actions for continuous integration:
    - Automated review on pull requests
 
 ### Coverage Note
+
 Bash code coverage measurement with kcov has fundamental limitations when tracing subprocess executions. The `COVERAGE_THRESHOLD` is set to 0 (disabled) because kcov cannot instrument subprocesses spawned by bats. **Test pass rate (100%) is the quality gate.** See [bats-core#15](https://github.com/bats-core/bats-core/issues/15) for details.
 
 ## Project Structure for Ralph-Managed Projects
 
 Each project created with `./setup.sh` follows this structure:
+
 ```
 project-name/
 ├── PROMPT.md          # Main development instructions
@@ -234,6 +250,7 @@ project-name/
 ## Template System
 
 Templates in `templates/` provide starting points for new projects:
+
 - **PROMPT.md** - Instructions for Ralph's autonomous behavior
 - **fix_plan.md** - Initial task structure
 - **AGENT.md** - Build system template
@@ -249,12 +266,14 @@ Templates in `templates/` provide starting points for new projects:
 ## Global Installation
 
 Ralph installs to:
+
 - **Commands**: `~/.local/bin/` (ralph, ralph-monitor, ralph-setup, ralph-import)
 - **Templates**: `~/.ralph/templates/`
 - **Scripts**: `~/.ralph/` (ralph_loop.sh, ralph_monitor.sh, setup.sh, ralph_import.sh)
 - **Libraries**: `~/.ralph/lib/` (circuit_breaker.sh, response_analyzer.sh, date_utils.sh)
 
 After installation, the following global commands are available:
+
 - `ralph` - Start the autonomous development loop
 - `ralph-monitor` - Launch the monitoring dashboard
 - `ralph-setup` - Create a new Ralph-managed project
@@ -263,6 +282,7 @@ After installation, the following global commands are available:
 ## Integration Points
 
 Ralph integrates with:
+
 - **Claude Code CLI**: Uses the `claude` CLI as the execution engine
 - **tmux**: Terminal multiplexer for integrated monitoring sessions
 - **Git**: Expects projects to be git repositories
@@ -275,6 +295,7 @@ Ralph integrates with:
 Ralph uses multiple mechanisms to detect when to exit:
 
 ### Exit Detection Thresholds
+
 - `MAX_CONSECUTIVE_TEST_LOOPS=3` - Exit if too many test-only iterations
 - `MAX_CONSECUTIVE_DONE_SIGNALS=2` - Exit on repeated completion signals
 - `TEST_PERCENTAGE_THRESHOLD=30%` - Flag if testing dominates recent loops
@@ -284,15 +305,16 @@ Ralph uses multiple mechanisms to detect when to exit:
 
 The `completion_indicators` exit condition requires dual verification:
 
-| completion_indicators | EXIT_SIGNAL | response analysis (`$STATE_DIR/.response_analysis`) | Result |
-|-----------------------|-------------|-------------------|--------|
-| >= 2 | `true` | exists | **Exit** ("project_complete") |
-| >= 2 | `false` | exists | **Continue** (Claude still working) |
-| >= 2 | N/A | missing | **Continue** (defaults to false) |
-| >= 2 | N/A | malformed | **Continue** (defaults to false) |
-| < 2 | `true` | exists | **Continue** (threshold not met) |
+| completion_indicators | EXIT_SIGNAL | response analysis (`$STATE_DIR/.response_analysis`) | Result                              |
+| --------------------- | ----------- | --------------------------------------------------- | ----------------------------------- |
+| >= 2                  | `true`      | exists                                              | **Exit** ("project_complete")       |
+| >= 2                  | `false`     | exists                                              | **Continue** (Claude still working) |
+| >= 2                  | N/A         | missing                                             | **Continue** (defaults to false)    |
+| >= 2                  | N/A         | malformed                                           | **Continue** (defaults to false)    |
+| < 2                   | `true`      | exists                                              | **Continue** (threshold not met)    |
 
 **Implementation** (`ralph_loop.sh:312-327`):
+
 ```bash
 local analysis_file="${RESPONSE_ANALYSIS_FILE:-.response_analysis}"
 local claude_exit_signal="false"
@@ -309,6 +331,7 @@ fi
 **Conflict Resolution:** When `STATUS: COMPLETE` but `EXIT_SIGNAL: false` in RALPH_STATUS, the explicit EXIT_SIGNAL takes precedence. This allows Claude to mark a phase complete while indicating more phases remain.
 
 ### Circuit Breaker Thresholds
+
 - `CB_NO_PROGRESS_THRESHOLD=3` - Open circuit after 3 loops with no file changes
 - `CB_SAME_ERROR_THRESHOLD=5` - Open circuit after 5 loops with repeated errors
 - `CB_OUTPUT_DECLINE_THRESHOLD=70%` - Open circuit if output declines by >70%
@@ -318,10 +341,12 @@ fi
 Ralph uses advanced error detection with two-stage filtering to eliminate false positives:
 
 **Stage 1: JSON Field Filtering**
+
 - Filters out JSON field patterns like `"is_error": false` that contain the word "error" but aren't actual errors
 - Pattern: `grep -v '"[^"]*error[^"]*":'`
 
 **Stage 2: Actual Error Detection**
+
 - Detects real error messages in specific contexts:
   - Error prefixes: `Error:`, `ERROR:`, `error:`
   - Context-specific errors: `]: error`, `Link: error`
@@ -330,6 +355,7 @@ Ralph uses advanced error detection with two-stage filtering to eliminate false 
 - Pattern: `grep -cE '(^Error:|^ERROR:|^error:|\]: error|Link: error|Error occurred|failed with error|[Ee]xception|Fatal|FATAL)'`
 
 **Multi-line Error Matching**
+
 - Detects stuck loops by verifying ALL error lines appear in ALL recent history files
 - Uses literal fixed-string matching (`grep -qF`) to avoid regex edge cases
 - Prevents false negatives when multiple distinct errors occur simultaneously
@@ -338,21 +364,22 @@ Ralph uses advanced error detection with two-stage filtering to eliminate false 
 
 ### Test Files (265 tests total)
 
-| File | Tests | Description |
-|------|-------|-------------|
-| `test_cli_parsing.bats` | 27 | CLI argument parsing for all 12 flags |
-| `test_cli_modern.bats` | 29 | Modern CLI commands (Phase 1.1) + build_claude_command fix |
-| `test_json_parsing.bats` | 36 | JSON output format parsing + Claude CLI format + session management |
-| `test_session_continuity.bats` | 26 | Session lifecycle management + circuit breaker integration |
-| `test_exit_detection.bats` | 20 | Exit signal detection |
-| `test_rate_limiting.bats` | 15 | Rate limiting behavior |
-| `test_loop_execution.bats` | 20 | Integration tests |
-| `test_edge_cases.bats` | 20 | Edge case handling |
-| `test_installation.bats` | 14 | Global installation/uninstall workflows |
-| `test_project_setup.bats` | 36 | Project setup (setup.sh) validation |
-| `test_prd_import.bats` | 33 | PRD import (ralph_import.sh) workflows + modern CLI tests |
+| File                           | Tests | Description                                                         |
+| ------------------------------ | ----- | ------------------------------------------------------------------- |
+| `test_cli_parsing.bats`        | 27    | CLI argument parsing for all 12 flags                               |
+| `test_cli_modern.bats`         | 29    | Modern CLI commands (Phase 1.1) + build_claude_command fix          |
+| `test_json_parsing.bats`       | 36    | JSON output format parsing + Claude CLI format + session management |
+| `test_session_continuity.bats` | 26    | Session lifecycle management + circuit breaker integration          |
+| `test_exit_detection.bats`     | 20    | Exit signal detection                                               |
+| `test_rate_limiting.bats`      | 15    | Rate limiting behavior                                              |
+| `test_loop_execution.bats`     | 20    | Integration tests                                                   |
+| `test_edge_cases.bats`         | 20    | Edge case handling                                                  |
+| `test_installation.bats`       | 14    | Global installation/uninstall workflows                             |
+| `test_project_setup.bats`      | 36    | Project setup (setup.sh) validation                                 |
+| `test_prd_import.bats`         | 33    | PRD import (ralph_import.sh) workflows + modern CLI tests           |
 
 ### Running Tests
+
 ```bash
 # All tests
 npm test
@@ -367,6 +394,7 @@ bats tests/unit/test_cli_parsing.bats
 ## Recent Improvements
 
 ### Modern CLI for PRD Import (v0.9.8)
+
 - Modernized `ralph_import.sh` to use Claude Code CLI JSON output format
   - Added `--output-format json` flag for structured responses
   - Implemented `detect_response_format()` for JSON vs text detection
@@ -387,6 +415,7 @@ bats tests/unit/test_cli_parsing.bats
 - Test count: 276 (up from 265)
 
 ### Session Lifecycle Management (v0.9.7)
+
 - Added complete session lifecycle management with automatic reset triggers:
   - `get_session_id()` - Retrieves current session from `.ralph_session`
   - `reset_session(reason)` - Clears session with reason logging
@@ -404,6 +433,7 @@ bats tests/unit/test_cli_parsing.bats
 - Test count: 265 (up from 239)
 
 ### JSON Output & Session Management (v0.9.6)
+
 - Extended `parse_json_response()` to support Claude Code CLI JSON format
   - Supports `result`, `sessionId`, and `metadata` fields alongside existing flat format
   - Extracts `metadata.files_changed`, `metadata.has_errors`, `metadata.completion_status`
@@ -418,6 +448,7 @@ bats tests/unit/test_cli_parsing.bats
 - Test count: 239 (up from 223)
 
 ### PRD Import Tests (v0.9.5)
+
 - Added 22 comprehensive tests for `ralph_import.sh` PRD conversion script
 - Tests cover: file format support (.md, .txt, .json), output file creation, project naming
 - Mock infrastructure for `ralph-setup` and Claude Code CLI isolation
@@ -431,6 +462,7 @@ bats tests/unit/test_cli_parsing.bats
 - Test count: 223 (up from 201)
 
 ### Project Setup Tests (v0.9.4)
+
 - Added 36 comprehensive tests for `setup.sh` project initialization script
 - Tests cover: directory creation, subdirectory structure, template copying, git initialization
 - Template copying verification for PROMPT.md, @fix_plan.md, @AGENT.md
@@ -444,6 +476,7 @@ bats tests/unit/test_cli_parsing.bats
 - Test count: 201 (up from 165)
 
 ### Installation Tests (v0.9.3)
+
 - Added 14 comprehensive tests for `install.sh` global installation script
 - Tests cover: directory creation, command installation, template copying, lib copying
 - Dependency detection tests (jq, git, node) with mocked failures
@@ -455,6 +488,7 @@ bats tests/unit/test_cli_parsing.bats
 - Test count: 165 (up from 151)
 
 ### Prompt File Fix (v0.9.2)
+
 - Fixed critical bug: replaced non-existent `--prompt-file` CLI flag with `-p` flag
 - Modern CLI mode now correctly passes prompt content via `CLAUDE_CMD_ARGS+=("-p" "$prompt_content")`
 - Added error handling for missing prompt files in `build_claude_command()`
@@ -463,6 +497,7 @@ bats tests/unit/test_cli_parsing.bats
 - Test count: 151 (up from 145)
 
 ### CLI Parsing Tests (v0.9.1)
+
 - Added 27 comprehensive CLI argument parsing tests
 - Covers all 12 CLI flags with both long and short forms
 - Boundary value testing for `--timeout` (0, 1, 120, 121)
@@ -470,6 +505,7 @@ bats tests/unit/test_cli_parsing.bats
 - Code review report: `docs/code-review/2026-01-08-cli-parsing-tests-review.md`
 
 ### CI/CD Pipeline (v0.9.1)
+
 - Added GitHub Actions workflow for automated testing
 - kcov coverage measurement (informational only due to subprocess limitations)
 - Coverage artifacts uploaded for debugging
@@ -478,6 +514,7 @@ bats tests/unit/test_cli_parsing.bats
 ### Modern CLI Commands (v0.9.1 - Phase 1.1)
 
 **JSON Output Format Support**
+
 - Added `detect_output_format()` function to identify JSON vs text output
 - Added `parse_json_response()` to extract structured fields from Claude's JSON output
 - Extracts: status, exit_signal, work_type, files_modified, error_count, summary
@@ -485,17 +522,20 @@ bats tests/unit/test_cli_parsing.bats
 - Maintains backward compatibility with traditional RALPH_STATUS format
 
 **Session Continuity Management**
+
 - `init_claude_session()` - Resume or start new sessions
 - `save_claude_session()` - Persist session ID from Claude output
 - `--continue` flag for context preservation across loops
 - `--no-continue` option for isolated iterations
 
 **Loop Context Injection**
+
 - `build_loop_context()` - Build contextual information for each loop
 - Includes: loop number, remaining tasks, circuit breaker state, previous work summary
 - Injected via `--append-system-prompt` for Claude awareness
 
 **Modern CLI Flags**
+
 - `--output-format json|text` - Control Claude output format
 - `--allowed-tools` - Restrict tool permissions
 - `-p` with content - Pass prompt content (reads from file via command substitution)
@@ -504,17 +544,20 @@ bats tests/unit/test_cli_parsing.bats
 ### Circuit Breaker Enhancements (v0.9.0)
 
 **Multi-line Error Matching Fix**
+
 - Fixed critical bug in `detect_stuck_loop` function where only the first error line was checked when multiple distinct errors occurred
 - Now verifies ALL error lines appear in ALL recent history files for accurate stuck loop detection
 - Uses nested loop checking with `grep -qF` for literal fixed-string matching
 
 **JSON Field False Positive Elimination**
+
 - Implemented two-stage error filtering to avoid counting JSON field names as errors
 - Stage 1 filters out patterns like `"is_error": false` that contain "error" as a field name
 - Stage 2 detects actual error messages in specific contexts
 - Aligned patterns between `response_analyzer.sh` and `ralph_loop.sh` for consistent behavior
 
 ### Installation Improvements
+
 - Added `lib/` directory to installation process for modular architecture
 - Fixed issue where `response_analyzer.sh` and `circuit_breaker.sh` were not being copied during global installation
 - All library components now properly installed to `~/.ralph/lib/`
@@ -540,18 +583,22 @@ bats tests/unit/test_cli_parsing.bats
 Before moving to the next feature, ALL changes must be:
 
 1. **Committed with Clear Messages**:
+
    ```bash
    git add .
    git commit -m "feat(module): descriptive message following conventional commits"
    ```
+
    - Use conventional commit format: `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, etc.
    - Include scope when applicable: `feat(loop):`, `fix(monitor):`, `test(setup):`
    - Write descriptive messages that explain WHAT changed and WHY
 
 2. **Pushed to Remote Repository**:
+
    ```bash
    git push origin <branch-name>
    ```
+
    - Never leave completed features uncommitted
    - Push regularly to maintain backup and enable collaboration
    - Ensure CI/CD pipelines pass before considering feature complete
@@ -621,6 +668,7 @@ Before marking ANY feature as complete, verify:
 ### Rationale
 
 These standards ensure:
+
 - **Quality**: Thorough testing prevents regressions in Ralph's autonomous behavior
 - **Traceability**: Git commits and @fix_plan.md provide clear history of changes
 - **Maintainability**: Current documentation reduces onboarding time and prevents knowledge loss
