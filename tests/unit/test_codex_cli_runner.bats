@@ -144,6 +144,11 @@ EOF
 
 @test "codex cli runner fails when last message is missing" {
     export CODEX_STUB_MODE="missing_last"
+    # Ensure the fix plan is NOT complete so the runner must invoke Codex.
+    cat > "$STATE_DIR/@fix_plan.md" << 'EOF'
+# Fix Plan
+- [ ] Incomplete task 1
+EOF
     run bash "$RUNNER_SCRIPT" --directory "$STATE_DIR" --calls 5 --timeout 1
     assert_failure
 
@@ -159,4 +164,3 @@ EOF
     [[ "$output" == *"deprecated"* ]]
     [[ "$output" == *"ralph-codex-cli.sh"* ]]
 }
-
