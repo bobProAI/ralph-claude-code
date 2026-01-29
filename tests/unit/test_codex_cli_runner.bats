@@ -28,6 +28,8 @@ EOF
     export PATH="$BIN_DIR:$PATH"
     export CODEX_STUB_MODE="success"
     export PNPM_SHOULD_FAIL="false"
+    export PNPM_STATE_FILE="$TEST_DIR/pnpm_state"
+    export RALPH_DISABLE_PNPM_SHIM="true"
 }
 
 teardown() {
@@ -84,6 +86,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+if [[ -n "${CODEX_CAPTURE_PROMPT:-}" ]]; then
+    cat - > "$CODEX_CAPTURE_PROMPT"
+else
+    cat - >/dev/null
+fi
+
 case "$mode" in
     success)
         if [[ -n "$output_file" ]]; then
@@ -118,7 +126,18 @@ EOF
     cat > "$BIN_DIR/pnpm" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${PNPM_SHOULD_FAIL:-false}" == "true" ]]; then
+mode="${PNPM_SHOULD_FAIL:-false}"
+state_file="${PNPM_STATE_FILE:-}"
+
+if [[ "$mode" == "once" ]]; then
+    if [[ -n "$state_file" && ! -f "$state_file" ]]; then
+        echo "1" > "$state_file" 2>/dev/null || true
+        echo "pnpm stub failure" >&2
+        exit 1
+    fi
+fi
+
+if [[ "$mode" == "true" ]]; then
     echo "pnpm stub failure" >&2
     exit 1
 fi
@@ -163,4 +182,16 @@ EOF
     assert_failure
     [[ "$output" == *"deprecated"* ]]
     [[ "$output" == *"ralph-codex-cli.sh"* ]]
+}
+
+@test "ship-gate failure after completion runs Codex in gate-fix mode (no re-decompose)" {
+    export PNPM_SHOULD_FAIL="once"
+    export CODEX_CAPTURE_PROMPT="$TEST_DIR/captured_prompt.md"
+
+    run bash "$RUNNER_SCRIPT" --directory "$STATE_DIR" --calls 5 --timeout 1
+    assert_success
+
+    assert_file_exists "$CODEX_CAPTURE_PROMPT"
+    run grep -q "MODE: FIX_SHIP_GATES" "$CODEX_CAPTURE_PROMPT"
+    assert_success
 }
